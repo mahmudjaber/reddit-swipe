@@ -1,4 +1,4 @@
-const APP_VERSION = '1.8.0';   // shown in the ＋ editor — bump with manifest.json
+const APP_VERSION = '1.9.0';   // shown in the ＋ editor — bump with manifest.json
 
 /* ================= CONFIG ================= */
 // Default subreddits for first launch — after that, edit your list in the app
@@ -671,8 +671,7 @@ function setBadge(s, text) {
 
 function videoSlide(post) {
   const rv = post._rv || post.media.reddit_video;
-  const noAudio = !!(rv.is_gif || rv.has_audio === false);
-  const s = baseSlide(post, noAudio ? 'GIF · no sound' : null);
+  const s = baseSlide(post, null);
 
   const media = el('div', 'media');
 
@@ -692,17 +691,20 @@ function videoSlide(post) {
   const ua = navigator.userAgent;
   const isSafari = /iPhone|iPad|iPod/.test(ua) ||
                    (/Safari\//.test(ua) && !/Chrome|Chromium|Edg\/|OPR\//.test(ua));
+  // Reddit's is_gif/has_audio metadata is unreliable in BOTH directions, so it
+  // never decides routing: anything with an HLS stream goes through HLS, which
+  // carries the audio whenever the source has any.
   if (isSafari && rv.hls_url) {
     s._path = 'native-hls';
     v.src = rv.hls_url;        // native HLS — audio is muxed in
-  } else if (rv.hls_url && window.Hls && Hls.isSupported() && !rv.is_gif && rv.has_audio !== false) {
+  } else if (rv.hls_url && window.Hls && Hls.isSupported()) {
     // hls.js — audio muxed in, adaptive bitrate for smoother buffering.
     // Attached lazily by the warm-up observer so off-screen slides cost nothing.
     s._path = 'hls.js';
     s._hlsUrl = rv.hls_url;
-  } else if (rv.is_gif || rv.has_audio === false) {
-    s._path = 'gif/no-audio';
-    v.src = rv.fallback_url;   // no audio track exists — video alone
+  } else if (!/^https:\/\/v\.redd\.it\//.test(rv.fallback_url || '')) {
+    s._path = 'mp4-external';
+    v.src = rv.fallback_url;   // e.g. imgur .gifv — no side-audio scheme exists
   } else {
     s._path = 'mp4+audio-el';
     // last resort: bare mp4 (video-only) + separate audio element. Reddit's
@@ -718,7 +720,7 @@ function videoSlide(post) {
     const a = document.createElement('audio');
     a.src = base + '/' + AUDIO_NAMES[ai] + query;
     a.addEventListener('error', () => {
-      if (++ai >= AUDIO_NAMES.length) return;
+      if (++ai >= AUDIO_NAMES.length) { setBadge(s, '🔇 no sound in this video'); return; }
       a.src = base + '/' + AUDIO_NAMES[ai] + query;
       if (soundOn && !v.paused) { a.currentTime = v.currentTime; a.play().catch(() => {}); }
     });
