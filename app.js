@@ -13,6 +13,8 @@ const PAGE_SIZE = 30;          // posts fetched per request per subreddit
 const LOAD_MORE_AT = 4;        // fetch more when this many slides from the end
 const BATCH_SIZE = 10;         // slides appended to My Feed at a time
 const MIN_BUFFER = 20;         // refill the My Feed pool below this many posts
+const MIN_VIDEO_BUFFER = 12;   // videos burn 3x faster than stills — refill early
+const VIDEOS_PER_STILL = 3;    // feed rhythm: 3 videos, then 1 picture/gallery
 // Where the proxy lives. '' = same origin (node server.js serves both the page
 // and /api/feed). If you host this HTML elsewhere (e.g. GitHub Pages), set this
 // to your deployed worker URL, e.g. 'https://reddit-swipe.<you>.workers.dev'
@@ -56,6 +58,7 @@ const my = {
   buffer: [],                // fetched-but-not-shown posts
   afters: {},                // sub -> cursor; null = exhausted
   fetching: false,
+  slot: 0,                   // position in the video/still rhythm, survives batches
 };
 
 const SORTS = [['hot', null], ['top', 'day'], ['rising', null], ['top', 'week']];
@@ -159,14 +162,17 @@ function usablePosts(data) {
 /* =======================================================================
    MY FEED — the mixing algorithm
    -----------------------------------------------------------------------
-   Each post gets a score:
-     popularity  log10(upvotes)            — crowd signal
-     buzz        log10(comments)           — discussion signal
-     freshness   exp decay (~36 h)         — newer wins ties
-     media type  video > gallery > image   — it's a video app
-     jitter      seeded random             — so every refresh reshuffles
-   Slides are then picked greedily by score with one constraint: avoid two
-   consecutive posts from the same subreddit (diversity interleave).
+   1) SCORING — each post gets a score:
+        popularity  log10(upvotes)          — crowd signal
+        buzz        log10(comments)         — discussion signal
+        velocity    upvotes per hour        — catches fast-rising posts
+        freshness   exp decay (~36 h)       — newer wins ties
+        length fit  short videos (≤60s) up, long (>3 min) down — swipe pacing
+        jitter      seeded random           — so every refresh reshuffles
+   2) RHYTHM — slides are dealt from two score-sorted pools (videos vs
+      pictures/galleries) in a fixed cycle: 3 videos, then 1 still. If one
+      pool runs dry the other fills in, so the feed never stalls.
+   3) DIVERSITY — avoid repeating any subreddit within the last 2 slides.
    Refresh re-seeds the jitter AND rotates each sub between hot / top(day) /
    rising / top(week), so refreshed feeds contain genuinely different posts.
    ======================================================================= */
@@ -187,23 +193,45 @@ function scorePost(p, seed) {
   const freshness = Math.exp(-hours / 36);
   const popularity = Math.log10((p.ups || 0) + 1);
   const buzz = Math.log10((p.num_comments || 0) + 1);
-  const type = p.is_video ? 1.6 : (p.is_gallery ? 0.9 : 0.5);
-  const jitter = seededRand(seed ^ hashStr(p.id));
-  return popularity * 0.9 + buzz * 0.5 + freshness * 2.2 + type + jitter * 1.5;
-}
-function pickBatch(buffer, seed, n) {
-  const scored = buffer
-    .map(p => ({ p, s: scorePost(p, seed) }))
-    .sort((a, b) => b.s - a.s);
-  const out = [];
-  let lastSub = null;
-  while (out.length < n && scored.length) {
-    let idx = scored.findIndex(x => x.p.subreddit !== lastSub);
-    if (idx === -1) idx = 0;                    // only one sub left — allow repeats
-    const [pick] = scored.splice(idx, 1);
-    out.push(pick.p);
-    lastSub = pick.p.subreddit;
+  const velocity = Math.log10((p.ups || 0) / (hours + 2) + 1);
+  let lengthFit = 0;
+  if (p.is_video) {
+    const d = (p.media && p.media.reddit_video && p.media.reddit_video.duration) || 0;
+    if (d > 0 && d <= 60) lengthFit = 0.4;        // snackable — ideal for swiping
+    else if (d > 180) lengthFit = -0.5;           // long videos buffer poorly here
   }
+  const jitter = seededRand(seed ^ hashStr(p.id));
+  return popularity * 0.8 + buzz * 0.4 + velocity * 1.2 + freshness * 2.0 +
+         lengthFit + jitter * 1.2;
+}
+
+function pickBatch(buffer, seed, n) {
+  const scored = buffer.map(p => ({ p, s: scorePost(p, seed) })).sort((a, b) => b.s - a.s);
+  const videos = scored.filter(x => x.p.is_video);
+  const stills = scored.filter(x => !x.p.is_video);   // galleries + single images
+  const out = [];
+  const recentSubs = [];
+
+  const takeFrom = pool => {
+    if (!pool.length) return null;
+    let idx = pool.findIndex(x => !recentSubs.includes(x.p.subreddit));
+    if (idx === -1) idx = 0;                     // few subs left — allow repeats
+    return pool.splice(idx, 1)[0].p;
+  };
+
+  while (out.length < n && (videos.length || stills.length)) {
+    const wantVideo = my.slot % (VIDEOS_PER_STILL + 1) < VIDEOS_PER_STILL;
+    const p = wantVideo ? (takeFrom(videos) || takeFrom(stills))
+                        : (takeFrom(stills) || takeFrom(videos));
+    if (!p) break;
+    // only advance the rhythm when the slot got its intended type, so a
+    // temporary video drought doesn't burn through the "still" slots
+    if (!!p.is_video === wantVideo) my.slot++;
+    out.push(p);
+    recentSubs.push(p.subreddit);
+    if (recentSubs.length > 2) recentSubs.shift();
+  }
+
   // remove picked posts from the buffer
   const taken = new Set(out.map(p => p.id));
   for (let i = buffer.length - 1; i >= 0; i--) if (taken.has(buffer[i].id)) buffer.splice(i, 1);
@@ -217,7 +245,9 @@ function randomSortPlan() {
 }
 
 async function ensureBuffer() {
-  if (my.fetching || my.buffer.length >= MIN_BUFFER) return;
+  if (my.fetching) return;
+  const videoCount = my.buffer.reduce((c, p) => c + (p.is_video ? 1 : 0), 0);
+  if (my.buffer.length >= MIN_BUFFER && videoCount >= MIN_VIDEO_BUFFER) return;
   const pending = subs.filter(s => my.afters[s] !== null); // null = exhausted
   if (pending.length === 0) return;
   my.fetching = true;
@@ -266,6 +296,7 @@ function enterMyFeed(reset) {
     my.sorts = randomSortPlan();
     my.buffer = [];
     my.afters = {};
+    my.slot = 0;
     seen.clear();
     feed.replaceChildren();
     feed.scrollTop = 0;
