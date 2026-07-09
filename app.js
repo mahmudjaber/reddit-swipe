@@ -1,4 +1,4 @@
-const APP_VERSION = '1.6.0';   // shown in the ＋ editor — bump with manifest.json
+const APP_VERSION = '1.7.0';   // shown in the ＋ editor — bump with manifest.json
 
 /* ================= CONFIG ================= */
 // Default subreddits for first launch — after that, edit your list in the app
@@ -221,6 +221,9 @@ function scorePost(p, seed) {
     const d = p._rv.duration || 0;
     if (d > 0 && d <= 60) lengthFit = 0.4;        // snackable — ideal for swiping
     else if (d > 180) lengthFit = -0.5;           // long videos buffer poorly here
+    // real videos (with sound) outrank silent gifs within the video slots
+    if (p._rv.is_gif || p._rv.has_audio === false) lengthFit -= 0.6;
+    else lengthFit += 0.3;
   }
   const jitter = seededRand(seed ^ hashStr(p.id));
   return popularity * 0.8 + buzz * 0.4 + velocity * 1.2 + freshness * 2.0 +
@@ -659,7 +662,8 @@ function fmt(n) {
 /* ----- video ----- */
 function videoSlide(post) {
   const rv = post._rv || post.media.reddit_video;
-  const s = baseSlide(post, null);
+  const noAudio = !!(rv.is_gif || rv.has_audio === false);
+  const s = baseSlide(post, noAudio ? 'GIF · no sound' : null);
 
   const media = el('div', 'media');
 
