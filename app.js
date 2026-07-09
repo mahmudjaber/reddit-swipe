@@ -35,6 +35,8 @@ try { subs = JSON.parse(localStorage.getItem('rs.subs')); } catch {}
 if (!Array.isArray(subs) || subs.length === 0) subs = DEFAULT_SUBREDDITS.slice();
 function saveSubs() { localStorage.setItem('rs.subs', JSON.stringify(subs)); }
 
+let showNsfw = localStorage.getItem('rs.nsfw') === '1';
+
 /* ---------- session state ---------- */
 let mode = 'my';             // 'my' = mixed algorithmic feed, 'sub' = single subreddit
 let currentSub = null;       // when mode === 'sub'
@@ -97,7 +99,8 @@ function usablePosts(data) {
   const out = [];
   for (const child of data.data.children) {
     const post = child.data;
-    if (post.stickied || post.over_18 || seen.has(post.id)) continue;
+    if (post.stickied || seen.has(post.id)) continue;
+    if (post.over_18 && !showNsfw) continue;
     if (!(post.is_video && post.media && post.media.reddit_video) &&
         !(post.is_gallery && post.media_metadata) &&
         !isDirectImage(post)) continue;
@@ -354,6 +357,19 @@ function openEditor() {
   addRow.appendChild(input);
   addRow.appendChild(addBtn);
   card.appendChild(addRow);
+
+  // 18+ toggle — only affects what YOUR logged-in Reddit account can already see
+  const nsfwRow = el('label', 'editor-row');
+  nsfwRow.appendChild(el('span', null, 'Show 18+ posts'));
+  const nsfwToggle = document.createElement('input');
+  nsfwToggle.type = 'checkbox';
+  nsfwToggle.checked = showNsfw;
+  nsfwToggle.onchange = () => {
+    showNsfw = nsfwToggle.checked;
+    localStorage.setItem('rs.nsfw', showNsfw ? '1' : '0');
+  };
+  nsfwRow.appendChild(nsfwToggle);
+  card.appendChild(nsfwRow);
 
   const done = el('button', 'editor-btn editor-done', 'Done');
   done.onclick = () => {
