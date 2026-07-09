@@ -1,4 +1,4 @@
-const APP_VERSION = '1.9.0';   // shown in the ＋ editor — bump with manifest.json
+const APP_VERSION = '1.10.0';   // shown in the ＋ editor — bump with manifest.json
 
 /* ================= CONFIG ================= */
 // Default subreddits for first launch — after that, edit your list in the app
@@ -574,6 +574,16 @@ async function soundDebug() {
   try { await v.play(); } catch (e) { playErr = e.name + ': ' + e.message; }
   await new Promise(r => setTimeout(r, 2500));
   const a2 = v.webkitAudioDecodedByteCount ?? -1;
+  let hlsInfo = 'n/a';
+  let manifestAudio = 'n/a';
+  if (s._hls) {
+    hlsInfo = `audioTracks=${s._hls.audioTracks.length} current=${s._hls.audioTrack} ` +
+              `levels=${s._hls.levels.length} worker=${s._hls.config.enableWorker}`;
+    try {
+      const txt = await (await fetch(s._hlsUrl)).text();
+      manifestAudio = (txt.match(/TYPE=AUDIO/g) || []).length + ' audio rendition(s) in manifest';
+    } catch (e) { manifestAudio = 'manifest fetch failed: ' + e.message; }
+  }
   alert([
     'app version: ' + APP_VERSION,
     'hls.js loaded: ' + !!window.Hls,
@@ -586,6 +596,8 @@ async function soundDebug() {
       : 'not used'),
     'play() rejection: ' + playErr,
     'global soundOn: ' + soundOn,
+    'hls state: ' + hlsInfo,
+    'manifest: ' + manifestAudio,
   ].join('\n'));
 }
 
@@ -884,6 +896,8 @@ function attachHls(s) {
     capLevelToPlayerSize: true,   // don't pull 1080p for a phone-sized viewport
     maxBufferLength: 15,          // seconds ahead — enough for smooth play,
     backBufferLength: 10,         // small enough to not hog memory/bandwidth
+    enableWorker: false,          // extension CSP blocks blob workers; hls.js's
+                                  // silent fallback can kill the audio pipeline
   });
   h.on(Hls.Events.ERROR, (_, d) => {
     s._hlsErr = d.type + '/' + d.details + (d.fatal ? ' FATAL' : '');
