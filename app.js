@@ -477,6 +477,44 @@ function openEditor() {
   nsfwRow.appendChild(nsfwToggle);
   card.appendChild(nsfwRow);
 
+  // transfer settings between devices (desktop Chrome ⇄ iPhone Orion, …)
+  const xferRow = el('div', 'editor-add');
+  const copyBtn = el('button', 'editor-btn', 'Copy my settings');
+  copyBtn.onclick = async () => {
+    const payload = JSON.stringify({ subs, nsfw: showNsfw });
+    try { await navigator.clipboard.writeText(payload); copyBtn.textContent = 'Copied ✓'; }
+    catch { prompt('Copy this:', payload); }
+    setTimeout(() => (copyBtn.textContent = 'Copy my settings'), 1500);
+  };
+  const pasteBtn = el('button', 'editor-btn', 'Paste settings');
+  pasteBtn.onclick = () => {
+    const raw = prompt('Paste your settings (from "Copy my settings" on the other device):');
+    if (!raw) return;
+    try {
+      const j = JSON.parse(raw);
+      if (!Array.isArray(j.subs) || !j.subs.every(s => /^[A-Za-z0-9_]{2,21}$/.test(s))) throw 0;
+      subs = j.subs;
+      showNsfw = !!j.nsfw;
+      localStorage.setItem('rs.nsfw', showNsfw ? '1' : '0');
+      nsfwToggle.checked = showNsfw;
+      saveSubs();
+      renderList();
+    } catch {
+      // also accept a plain comma/space separated list of subreddit names
+      const names = raw.split(/[,\s]+/).map(s => s.trim().replace(/^\/?(r\/)?/i, '')).filter(Boolean);
+      if (names.length && names.every(s => /^[A-Za-z0-9_]{2,21}$/.test(s))) {
+        subs = names;
+        saveSubs();
+        renderList();
+      } else {
+        alert('Could not read that — paste exactly what "Copy my settings" produced');
+      }
+    }
+  };
+  xferRow.appendChild(copyBtn);
+  xferRow.appendChild(pasteBtn);
+  card.appendChild(xferRow);
+
   const done = el('button', 'editor-btn editor-done', 'Done');
   done.onclick = () => {
     saveSubs();
