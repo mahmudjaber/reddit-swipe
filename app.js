@@ -697,6 +697,7 @@ function videoSlide(post) {
 
 function toggleSound() {
   soundOn = !soundOn;
+  blessNearbyVideos();   // we're inside a tap — grant sound rights to nearby videos
   document.querySelectorAll('.slide').forEach(s => {
     if (s._soundBtn) s._soundBtn.querySelector('.icon').textContent = soundOn ? '🔊' : '🔇';
     if (!s._video) return;
@@ -819,7 +820,15 @@ const io = new IntersectionObserver(entries => {
       s.classList.remove('paused');
       attachHls(s);
       if (!s._audio) s._video.muted = !soundOn;   // hls/native slides follow global sound
-      s._video.play().catch(() => {});
+      const p = s._video.play();
+      if (p) p.catch(() => {
+        // WebKit (Safari/Orion) refuses unmuted programmatic play on elements
+        // it hasn't user-activated — better muted than frozen
+        if (!s._video.muted) {
+          s._video.muted = true;
+          s._video.play().catch(() => {});
+        }
+      });
     } else {
       s._video.pause();
       if (s._audio) s._audio.pause();
@@ -850,6 +859,28 @@ const warmIO = new IntersectionObserver(entries => {
     }
   }
 }, { rootMargin: '250% 0px 250% 0px', threshold: 0 });
+
+// WebKit (iPhone Safari/Orion) only lets a media element produce sound if a
+// play() was ever issued on it DURING a user gesture. A swipe is a gesture:
+// on every touch/pointer release, synchronously play()+pause() the nearby
+// not-yet-blessed videos so they may autoplay WITH sound when swiped to.
+function blessNearbyVideos() {
+  if (!soundOn) return;
+  for (const s of feed.children) {
+    const v = s._video;
+    if (!v || s._blessed) continue;
+    const r = s.getBoundingClientRect();
+    if (r.top > innerHeight * 3 || r.bottom < -innerHeight) continue;
+    s._blessed = true;
+    if (!v.paused) continue;                     // already playing (the current one)
+    attachHls(s);
+    const p = v.play();                          // inside the gesture → grants sound
+    v.pause();                                   // sync pause: no audible blip
+    if (p) p.catch(() => { s._blessed = false; });
+  }
+}
+feed.addEventListener('touchend', blessNearbyVideos, { passive: true });
+feed.addEventListener('pointerup', blessNearbyVideos, { passive: true });
 
 new MutationObserver(muts => {
   for (const m of muts) for (const n of m.addedNodes) {
