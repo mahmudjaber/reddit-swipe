@@ -1,3 +1,5 @@
+const APP_VERSION = '1.4.0';   // shown in the ＋ editor — bump with manifest.json
+
 /* ================= CONFIG ================= */
 // Default subreddits for first launch — after that, edit your list in the app
 // (＋ button in the top bar). Your picks are saved in the browser.
@@ -425,7 +427,7 @@ function highlightChip(key) {
 function openEditor() {
   const overlay = el('div', 'editor-overlay');
   const card = el('div', 'editor-card');
-  card.appendChild(el('div', 'editor-title', 'My Feed subreddits'));
+  card.appendChild(el('div', 'editor-title', `My Feed subreddits — v${APP_VERSION}`));
 
   const list = el('div', 'editor-list');
   const renderList = () => {
