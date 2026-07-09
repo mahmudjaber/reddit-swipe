@@ -59,6 +59,7 @@ const my = {
   afters: {},                // sub -> cursor; null = exhausted
   fetching: false,
   slot: 0,                   // position in the video/still rhythm, survives batches
+  videoYield: {},            // sub -> videos found so far (guides deep refills)
 };
 
 const SORTS = [['hot', null], ['top', 'day'], ['rising', null], ['top', 'week']];
@@ -144,15 +145,30 @@ async function fetchSubPage(sub, sort, t, cursor) {
   return json;
 }
 
+// Find a playable video for a post, looking beyond native reddit video:
+// crossposts carry the video on their parent, and animated GIFs (imgur .gifv,
+// direct .gif posts) come with an mp4 rendition in the preview.
+function videoInfoOf(post) {
+  if (post.media && post.media.reddit_video) return post.media.reddit_video;
+  const xp = post.crosspost_parent_list && post.crosspost_parent_list[0];
+  if (xp && xp.media && xp.media.reddit_video) return xp.media.reddit_video;
+  const rvp = post.preview && post.preview.reddit_video_preview;
+  if (rvp && rvp.fallback_url) return { ...rvp, has_audio: false, is_gif: true };
+  if (/\.gifv$/i.test(post.url || '')) {
+    return { fallback_url: post.url.replace(/\.gifv$/i, '.mp4'), has_audio: false, is_gif: true };
+  }
+  return null;
+}
+
 function usablePosts(data) {
   const out = [];
   for (const child of data.data.children) {
     const post = child.data;
     if (post.stickied || seen.has(post.id)) continue;
     if (post.over_18 && !showNsfw) continue;
-    if (!(post.is_video && post.media && post.media.reddit_video) &&
-        !(post.is_gallery && post.media_metadata) &&
-        !isDirectImage(post)) continue;
+    const rv = videoInfoOf(post);       // prefer motion: a .gif still gets played as video
+    if (rv) post._rv = rv;
+    else if (!(post.is_gallery && post.media_metadata) && !isDirectImage(post)) continue;
     seen.add(post.id);
     out.push(post);
   }
@@ -195,8 +211,8 @@ function scorePost(p, seed) {
   const buzz = Math.log10((p.num_comments || 0) + 1);
   const velocity = Math.log10((p.ups || 0) / (hours + 2) + 1);
   let lengthFit = 0;
-  if (p.is_video) {
-    const d = (p.media && p.media.reddit_video && p.media.reddit_video.duration) || 0;
+  if (p._rv) {
+    const d = p._rv.duration || 0;
     if (d > 0 && d <= 60) lengthFit = 0.4;        // snackable — ideal for swiping
     else if (d > 180) lengthFit = -0.5;           // long videos buffer poorly here
   }
@@ -207,8 +223,8 @@ function scorePost(p, seed) {
 
 function pickBatch(buffer, seed, n) {
   const scored = buffer.map(p => ({ p, s: scorePost(p, seed) })).sort((a, b) => b.s - a.s);
-  const videos = scored.filter(x => x.p.is_video);
-  const stills = scored.filter(x => !x.p.is_video);   // galleries + single images
+  const videos = scored.filter(x => x.p._rv);
+  const stills = scored.filter(x => !x.p._rv);   // galleries + single images
   const out = [];
   const recentSubs = [];
 
@@ -226,7 +242,7 @@ function pickBatch(buffer, seed, n) {
     if (!p) break;
     // only advance the rhythm when the slot got its intended type, so a
     // temporary video drought doesn't burn through the "still" slots
-    if (!!p.is_video === wantVideo) my.slot++;
+    if (!!p._rv === wantVideo) my.slot++;
     out.push(p);
     recentSubs.push(p.subreddit);
     if (recentSubs.length > 2) recentSubs.shift();
@@ -246,20 +262,32 @@ function randomSortPlan() {
 
 async function ensureBuffer() {
   if (my.fetching) return;
-  const videoCount = my.buffer.reduce((c, p) => c + (p.is_video ? 1 : 0), 0);
-  if (my.buffer.length >= MIN_BUFFER && videoCount >= MIN_VIDEO_BUFFER) return;
-  const pending = subs.filter(s => my.afters[s] !== null); // null = exhausted
-  if (pending.length === 0) return;
   my.fetching = true;
   try {
-    const results = await Promise.allSettled(pending.map(async sub => {
-      const [sort, t] = my.sorts[sub] || ['hot', null];
-      const data = await fetchSubPage(sub, sort, t, my.afters[sub]);
-      my.afters[sub] = data.data.after || null;
-      my.buffer.push(...usablePosts(data));
-    }));
-    const failures = results.filter(r => r.status === 'rejected');
-    if (failures.length === pending.length) throw failures[0].reason;
+    // videos deplete 3x faster than stills, and picture-heavy subs may only
+    // have a handful per page — paginate deeper (up to 3 rounds) until the
+    // video pool is healthy, and after round 1 only re-fetch subs that have
+    // actually been yielding videos, to not waste rate budget on photo subs.
+    for (let round = 0; round < 3; round++) {
+      const videoCount = my.buffer.reduce((c, p) => c + (p._rv ? 1 : 0), 0);
+      if (my.buffer.length >= MIN_BUFFER && videoCount >= MIN_VIDEO_BUFFER) return;
+      let pending = subs.filter(s => my.afters[s] !== null); // null = exhausted
+      if (round > 0) {
+        const yielding = pending.filter(s => (my.videoYield[s] || 0) > 0);
+        if (yielding.length) pending = yielding;
+      }
+      if (pending.length === 0) return;
+      const results = await Promise.allSettled(pending.map(async sub => {
+        const [sort, t] = my.sorts[sub] || ['hot', null];
+        const data = await fetchSubPage(sub, sort, t, my.afters[sub]);
+        my.afters[sub] = data.data.after || null;
+        const posts = usablePosts(data);
+        my.videoYield[sub] = (my.videoYield[sub] || 0) + posts.filter(p => p._rv).length;
+        my.buffer.push(...posts);
+      }));
+      const failures = results.filter(r => r.status === 'rejected');
+      if (failures.length === pending.length) throw failures[0].reason;
+    }
   } finally {
     my.fetching = false;
   }
@@ -297,6 +325,7 @@ function enterMyFeed(reset) {
     my.buffer = [];
     my.afters = {};
     my.slot = 0;
+    my.videoYield = {};
     seen.clear();
     feed.replaceChildren();
     feed.scrollTop = 0;
@@ -484,7 +513,7 @@ statusEl.addEventListener('click', () => {
    SLIDE BUILDERS
    ======================================================================= */
 function buildSlide(post) {
-  if (post.is_video && post.media && post.media.reddit_video) return videoSlide(post);
+  if (post._rv || (post.is_video && post.media && post.media.reddit_video)) return videoSlide(post);
   if (post.is_gallery && post.media_metadata) return gallerySlide(post);
   if (isDirectImage(post)) return imageSlide(post);
   return null;
@@ -538,7 +567,7 @@ function fmt(n) {
 
 /* ----- video ----- */
 function videoSlide(post) {
-  const rv = post.media.reddit_video;
+  const rv = post._rv || post.media.reddit_video;
   const s = baseSlide(post, null);
 
   const media = el('div', 'media');
