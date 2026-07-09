@@ -1,4 +1,4 @@
-const APP_VERSION = '1.5.0';   // shown in the ＋ editor — bump with manifest.json
+const APP_VERSION = '1.6.0';   // shown in the ＋ editor — bump with manifest.json
 
 /* ================= CONFIG ================= */
 // Default subreddits for first launch — after that, edit your list in the app
@@ -534,6 +534,10 @@ function openEditor() {
   xferRow.appendChild(pasteBtn);
   card.appendChild(xferRow);
 
+  const dbg = el('button', 'editor-btn', 'Sound debug');
+  dbg.onclick = () => { overlay.remove(); soundDebug(); };
+  card.appendChild(dbg);
+
   const done = el('button', 'editor-btn editor-done', 'Done');
   done.onclick = () => {
     saveSubs();
@@ -548,6 +552,36 @@ function openEditor() {
   overlay.addEventListener('click', e => { if (e.target === overlay) done.onclick(); });
   document.body.appendChild(overlay);
   input.focus();
+}
+
+/* =======================================================================
+   SOUND SELF-TEST — ＋ editor → "Sound debug"
+   ======================================================================= */
+async function soundDebug() {
+  const slides = [...document.querySelectorAll('.slide')];
+  const s = slides.find(x => x._video && !x._video.paused) || slides.find(x => x._video);
+  if (!s) return alert('No video slide on screen — swipe to a video first');
+  const v = s._video;
+  const a1 = v.webkitAudioDecodedByteCount ?? -1;
+  v.muted = false;
+  if (s._audio) { s._audio.currentTime = v.currentTime; s._audio.play().catch(() => {}); }
+  let playErr = 'none';
+  try { await v.play(); } catch (e) { playErr = e.name + ': ' + e.message; }
+  await new Promise(r => setTimeout(r, 2500));
+  const a2 = v.webkitAudioDecodedByteCount ?? -1;
+  alert([
+    'app version: ' + APP_VERSION,
+    'hls.js loaded: ' + !!window.Hls,
+    'video path: ' + (s._path || 'unknown'),
+    'hls attached: ' + !!s._hls + '   hls error: ' + (s._hlsErr || 'none'),
+    'playing: ' + !v.paused + '   muted: ' + v.muted + '   volume: ' + v.volume,
+    'audio decoded bytes: ' + a1 + ' → ' + a2 + (a2 > a1 ? '   (audio IS decoding)' : '   (NO audio decoding!)'),
+    'audio element: ' + (s._audio
+      ? (s._audio.error ? 'ERROR code ' + s._audio.error.code : (s._audio.paused ? 'paused' : 'playing') + ' — ' + s._audio.src.split('/').pop().split('?')[0])
+      : 'not used'),
+    'play() rejection: ' + playErr,
+    'global soundOn: ' + soundOn,
+  ].join('\n'));
 }
 
 /* =======================================================================
@@ -646,14 +680,18 @@ function videoSlide(post) {
   const isSafari = /iPhone|iPad|iPod/.test(ua) ||
                    (/Safari\//.test(ua) && !/Chrome|Chromium|Edg\/|OPR\//.test(ua));
   if (isSafari && rv.hls_url) {
+    s._path = 'native-hls';
     v.src = rv.hls_url;        // native HLS — audio is muxed in
   } else if (rv.hls_url && window.Hls && Hls.isSupported() && !rv.is_gif && rv.has_audio !== false) {
     // hls.js — audio muxed in, adaptive bitrate for smoother buffering.
     // Attached lazily by the warm-up observer so off-screen slides cost nothing.
+    s._path = 'hls.js';
     s._hlsUrl = rv.hls_url;
   } else if (rv.is_gif || rv.has_audio === false) {
+    s._path = 'gif/no-audio';
     v.src = rv.fallback_url;   // no audio track exists — video alone
   } else {
+    s._path = 'mp4+audio-el';
     // last resort: bare mp4 (video-only) + separate audio element. Reddit's
     // audio filename varies by transcoding era, so walk the candidates until
     // one loads.
@@ -820,6 +858,9 @@ function attachHls(s) {
     capLevelToPlayerSize: true,   // don't pull 1080p for a phone-sized viewport
     maxBufferLength: 15,          // seconds ahead — enough for smooth play,
     backBufferLength: 10,         // small enough to not hog memory/bandwidth
+  });
+  h.on(Hls.Events.ERROR, (_, d) => {
+    s._hlsErr = d.type + '/' + d.details + (d.fatal ? ' FATAL' : '');
   });
   h.loadSource(s._hlsUrl);
   h.attachMedia(s._video);
