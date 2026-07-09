@@ -1,4 +1,4 @@
-const APP_VERSION = '1.4.0';   // shown in the ＋ editor — bump with manifest.json
+const APP_VERSION = '1.5.0';   // shown in the ＋ editor — bump with manifest.json
 
 /* ================= CONFIG ================= */
 // Default subreddits for first launch — after that, edit your list in the app
@@ -46,7 +46,8 @@ let mode = 'my';             // 'my' = mixed algorithmic feed, 'sub' = single su
 let currentSub = null;       // when mode === 'sub'
 let loading = false;
 let soundOn = false;         // global mute state (autoplay must start muted)
-const seen = new Set();
+const seen = new Set();      // per-feed-build fetch dedup
+const shownIds = new Set();  // everything shown this session — refresh won't repeat these
 
 // single-sub mode
 let subAfter = null;
@@ -62,6 +63,8 @@ const my = {
   fetching: false,
   slot: 0,                   // position in the video/still rhythm, survives batches
   videoYield: {},            // sub -> videos found so far (guides deep refills)
+  sortCursor: (Math.random() * 4) | 0,  // advanced on refresh → different sorts
+  recycled: false,           // whether shownIds was already recycled this build
 };
 
 const SORTS = [['hot', null], ['top', 'day'], ['rising', null], ['top', 'week']];
@@ -162,11 +165,12 @@ function videoInfoOf(post) {
   return null;
 }
 
-function usablePosts(data) {
+function usablePosts(data, skipShown) {
   const out = [];
   for (const child of data.data.children) {
     const post = child.data;
     if (post.stickied || seen.has(post.id)) continue;
+    if (skipShown && shownIds.has(post.id)) continue;
     if (post.over_18 && !showNsfw) continue;
     const rv = videoInfoOf(post);       // prefer motion: a .gif still gets played as video
     if (rv) post._rv = rv;
@@ -256,9 +260,12 @@ function pickBatch(buffer, seed, n) {
   return out;
 }
 
-function randomSortPlan() {
+// every refresh advances the cursor, so each sub gets a genuinely different
+// sort than last time (random picks kept colliding → same cached listing)
+function rotatedSortPlan() {
+  my.sortCursor = (my.sortCursor + 1) % SORTS.length;
   const plan = {};
-  for (const s of subs) plan[s] = SORTS[(Math.random() * SORTS.length) | 0];
+  subs.forEach((s, i) => { plan[s] = SORTS[(i + my.sortCursor) % SORTS.length]; });
   return plan;
 }
 
@@ -283,7 +290,7 @@ async function ensureBuffer() {
         const [sort, t] = my.sorts[sub] || ['hot', null];
         const data = await fetchSubPage(sub, sort, t, my.afters[sub]);
         my.afters[sub] = data.data.after || null;
-        const posts = usablePosts(data);
+        const posts = usablePosts(data, true);   // never re-show this session's posts
         my.videoYield[sub] = (my.videoYield[sub] || 0) + posts.filter(p => p._rv).length;
         my.buffer.push(...posts);
       }));
@@ -303,10 +310,19 @@ async function myLoadMore() {
     const batch = pickBatch(my.buffer, my.seed, BATCH_SIZE);
     for (const post of batch) {
       const slide = buildSlide(post);
-      if (slide) feed.appendChild(slide);
+      if (slide) { feed.appendChild(slide); shownIds.add(post.id); }
     }
     if (feed.children.length > 0) hideStatus();
     else if (subs.every(s => my.afters[s] === null)) {
+      // everything ever fetched was already shown this session — recycle once
+      if (!my.recycled && shownIds.size) {
+        my.recycled = true;
+        shownIds.clear();
+        seen.clear();
+        my.afters = {};
+        loading = false;
+        return myLoadMore();
+      }
       showStatus('No playable posts found in your subreddits — edit the list with ＋', false);
     }
     ensureBuffer(); // fire-and-forget refill for the next batch
@@ -323,11 +339,12 @@ function enterMyFeed(reset) {
   currentSub = null;
   if (reset) {
     my.seed = (Math.random() * 2 ** 31) | 0;
-    my.sorts = randomSortPlan();
+    my.sorts = rotatedSortPlan();
     my.buffer = [];
     my.afters = {};
     my.slot = 0;
     my.videoYield = {};
+    my.recycled = false;
     seen.clear();
     feed.replaceChildren();
     feed.scrollTop = 0;
@@ -883,6 +900,15 @@ function blessNearbyVideos() {
 }
 feed.addEventListener('touchend', blessNearbyVideos, { passive: true });
 feed.addEventListener('pointerup', blessNearbyVideos, { passive: true });
+
+// recovery: if a browser silently stripped sound (blocked unmute), any click
+// re-asserts it on whatever is currently playing
+document.addEventListener('click', () => {
+  if (!soundOn) return;
+  document.querySelectorAll('.slide').forEach(s => {
+    if (s._video && !s._video.paused && !s._audio) s._video.muted = false;
+  });
+});
 
 new MutationObserver(muts => {
   for (const m of muts) for (const n of m.addedNodes) {
