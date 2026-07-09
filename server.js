@@ -53,9 +53,14 @@ async function getToken() {
   return token.value;
 }
 
-async function feed(sub, after, limit) {
-  const url = `https://oauth.reddit.com/r/${encodeURIComponent(sub)}/hot?raw_json=1&limit=${limit}` +
-              (after ? `&after=${encodeURIComponent(after)}` : '');
+const SORTS = new Set(['hot', 'new', 'rising', 'top']);
+const TIMES = new Set(['hour', 'day', 'week', 'month', 'year', 'all']);
+
+async function feed(sub, after, limit, sort, t) {
+  if (!SORTS.has(sort)) sort = 'hot';
+  const url = `https://oauth.reddit.com/r/${encodeURIComponent(sub)}/${sort}?raw_json=1&limit=${limit}` +
+              (after ? `&after=${encodeURIComponent(after)}` : '') +
+              (t && TIMES.has(t) ? `&t=${t}` : '');
   const cached = feedCache.get(url);
   if (cached && Date.now() < cached.expiresAt) return cached.body;
 
@@ -80,7 +85,8 @@ http.createServer(async (req, res) => {
     const limit = Math.min(parseInt(u.searchParams.get('limit') || '40', 10) || 40, 100);
     if (!sub) { res.writeHead(400); return res.end(JSON.stringify({ error: 'missing ?sub=' })); }
     try {
-      const body = await feed(sub, u.searchParams.get('after'), limit);
+      const body = await feed(sub, u.searchParams.get('after'), limit,
+                              u.searchParams.get('sort') || 'hot', u.searchParams.get('t'));
       res.writeHead(200);
       res.end(body);
     } catch (err) {

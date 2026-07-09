@@ -1,5 +1,7 @@
-/* ================= CONFIG — edit your subreddits here ================= */
-const SUBREDDITS = [
+/* ================= CONFIG ================= */
+// Default subreddits for first launch — after that, edit your list in the app
+// (＋ button in the top bar). Your picks are saved in the browser.
+const DEFAULT_SUBREDDITS = [
   'oddlysatisfying',
   'aww',
   'nextfuckinglevel',
@@ -7,13 +9,15 @@ const SUBREDDITS = [
   'interestingasfuck',
   'EarthPorn',
 ];
-const PAGE_SIZE = 40;          // posts fetched per request
-const LOAD_MORE_AT = 4;        // fetch next page when this many slides from the end
+const PAGE_SIZE = 30;          // posts fetched per request per subreddit
+const LOAD_MORE_AT = 4;        // fetch more when this many slides from the end
+const BATCH_SIZE = 10;         // slides appended to My Feed at a time
+const MIN_BUFFER = 20;         // refill the My Feed pool below this many posts
 // Where the proxy lives. '' = same origin (node server.js serves both the page
 // and /api/feed). If you host this HTML elsewhere (e.g. GitHub Pages), set this
 // to your deployed worker URL, e.g. 'https://reddit-swipe.<you>.workers.dev'
 const API_BASE = '';
-/* ====================================================================== */
+/* ========================================== */
 
 const DEMO = new URLSearchParams(location.search).has('demo');
 // Running as a Chrome extension page: host_permissions let us call reddit.com
@@ -25,14 +29,36 @@ const topbar = document.getElementById('topbar');
 const statusEl = document.getElementById('status');
 const statusText = document.getElementById('status-text');
 
-let currentSub = SUBREDDITS[0];
-let after = null;            // reddit pagination cursor
+/* ---------- persistent state ---------- */
+let subs;
+try { subs = JSON.parse(localStorage.getItem('rs.subs')); } catch {}
+if (!Array.isArray(subs) || subs.length === 0) subs = DEFAULT_SUBREDDITS.slice();
+function saveSubs() { localStorage.setItem('rs.subs', JSON.stringify(subs)); }
+
+/* ---------- session state ---------- */
+let mode = 'my';             // 'my' = mixed algorithmic feed, 'sub' = single subreddit
+let currentSub = null;       // when mode === 'sub'
 let loading = false;
-let exhausted = false;
 let soundOn = false;         // global mute state (autoplay must start muted)
 const seen = new Set();
 
-/* tiny DOM helper — everything data-driven is set via textContent (no innerHTML) */
+// single-sub mode
+let subAfter = null;
+let subExhausted = false;
+let subSortIdx = 0;          // cycles hot → top(day) → rising → top(week) on refresh
+
+// My Feed mode
+const my = {
+  seed: (Math.random() * 2 ** 31) | 0,
+  sorts: {},                 // sub -> [sort, t] chosen for this session/refresh
+  buffer: [],                // fetched-but-not-shown posts
+  afters: {},                // sub -> cursor; null = exhausted
+  fetching: false,
+};
+
+const SORTS = [['hot', null], ['top', 'day'], ['rising', null], ['top', 'week']];
+
+/* ---------- tiny DOM helper — all data-driven text via textContent ---------- */
 function el(tag, className, text) {
   const n = document.createElement(tag);
   if (className) n.className = className;
@@ -40,138 +66,330 @@ function el(tag, className, text) {
   return n;
 }
 
-/* ---------- top bar chips ---------- */
-for (const sub of SUBREDDITS) {
-  const b = el('button', 'chip' + (sub === currentSub ? ' active' : ''), 'r/' + sub);
-  b.onclick = () => switchSub(sub, b);
-  topbar.appendChild(b);
-}
-
-function switchSub(sub, chipEl) {
-  if (sub === currentSub) return;
-  currentSub = sub;
-  after = null;
-  exhausted = false;
-  seen.clear();
-  document.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
-  chipEl.classList.add('active');
-  feed.innerHTML = '';
-  feed.scrollTop = 0;
-  showStatus('Loading r/' + sub + '…');
-  loadMore();
-}
-
-function showStatus(msg, spin = true) {
-  statusEl.classList.remove('hidden');
-  statusEl.querySelector('.spinner').style.display = spin ? '' : 'none';
-  statusText.textContent = msg;
-}
-function hideStatus() { statusEl.classList.add('hidden'); }
-
-/* ---------- fetching ---------- */
-async function fetchPage(sub, cursor) {
+/* =======================================================================
+   FETCHING
+   ======================================================================= */
+async function fetchSubPage(sub, sort, t, cursor) {
   if (DEMO) return demoPage(cursor);
+  const qs = `limit=${PAGE_SIZE}&raw_json=1` +
+             (cursor ? `&after=${encodeURIComponent(cursor)}` : '') +
+             (t ? `&t=${t}` : '');
+  let res;
   if (EXTENSION) {
-    const url = `https://www.reddit.com/r/${encodeURIComponent(sub)}/hot.json?limit=${PAGE_SIZE}&raw_json=1` +
-                (cursor ? `&after=${encodeURIComponent(cursor)}` : '');
-    const res = await fetch(url, { credentials: 'include' });
+    res = await fetch(`https://www.reddit.com/r/${encodeURIComponent(sub)}/${sort}.json?${qs}`,
+                      { credentials: 'include' });
     if (!res.ok) {
       throw new Error('Reddit responded HTTP ' + res.status +
         (res.status === 403 ? ' — open reddit.com in another tab (log in), then tap here to retry' : ''));
     }
-    return res.json();
-  }
-  const url = `${API_BASE}/api/feed?sub=${encodeURIComponent(sub)}&limit=${PAGE_SIZE}` +
-              (cursor ? `&after=${encodeURIComponent(cursor)}` : '');
-  const res = await fetch(url);
-  if (!res.ok) {
-    let msg = 'proxy responded ' + res.status;
-    try { const e = await res.json(); if (e.error) msg = e.error; } catch {}
-    throw new Error(msg);
+  } else {
+    res = await fetch(`${API_BASE}/api/feed?sub=${encodeURIComponent(sub)}&sort=${sort}&${qs}`);
+    if (!res.ok) {
+      let msg = 'proxy responded ' + res.status;
+      try { const e = await res.json(); if (e.error) msg = e.error; } catch {}
+      throw new Error(msg);
+    }
   }
   return res.json();
 }
 
-/* ---------- demo mode (?demo in the URL) — sample media, no Reddit needed ---------- */
-const DEMO_VIDEOS = [
-  'https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4',
-  'https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/720/Big_Buck_Bunny_720_10s_5MB.mp4',
-  'https://test-videos.co.uk/vids/jellyfish/mp4/h264/720/Jellyfish_720_10s_5MB.mp4',
-  'https://test-videos.co.uk/vids/sintel/mp4/h264/720/Sintel_720_10s_5MB.mp4',
-];
-
-let demoCount = 0;
-function demoPage(cursor) {
-  const children = [];
-  for (let i = 0; i < 8; i++) {
-    const n = demoCount++;
-    const kind = n % 3; // rotate: video, gallery, image
-    const base = {
-      id: 'demo' + n, subreddit: 'demo', author: 'sample',
-      ups: 1200 + n * 137, num_comments: 45 + n * 7,
-      permalink: '/r/demo/', stickied: false, over_18: false,
-    };
-    if (kind === 0) {
-      children.push({ data: { ...base,
-        title: `Demo video #${n} — swipe up for the next one`,
-        is_video: true,
-        media: { reddit_video: { fallback_url: DEMO_VIDEOS[n % DEMO_VIDEOS.length] } },
-      }});
-    } else if (kind === 1) {
-      const ids = [0, 1, 2, 3].map(j => 'g' + n + j);
-      const meta = {};
-      for (const id of ids) {
-        meta[id] = { status: 'valid', s: { u: `https://picsum.photos/seed/${id}/900/1600` } };
-      }
-      children.push({ data: { ...base,
-        title: `Demo gallery #${n} — swipe RIGHT through the pictures`,
-        is_gallery: true,
-        gallery_data: { items: ids.map(id => ({ media_id: id })) },
-        media_metadata: meta,
-      }});
-    } else {
-      children.push({ data: { ...base,
-        title: `Demo photo #${n}`,
-        url: `https://picsum.photos/seed/img${n}/900/1600.jpg`,
-        post_hint: 'image',
-      }});
-    }
+function usablePosts(data) {
+  const out = [];
+  for (const child of data.data.children) {
+    const post = child.data;
+    if (post.stickied || post.over_18 || seen.has(post.id)) continue;
+    if (!(post.is_video && post.media && post.media.reddit_video) &&
+        !(post.is_gallery && post.media_metadata) &&
+        !isDirectImage(post)) continue;
+    seen.add(post.id);
+    out.push(post);
   }
-  return { data: { after: 'demo-cursor-' + demoCount, children } };
+  return out;
 }
 
-async function loadMore() {
-  if (loading || exhausted) return;
+/* =======================================================================
+   MY FEED — the mixing algorithm
+   -----------------------------------------------------------------------
+   Each post gets a score:
+     popularity  log10(upvotes)            — crowd signal
+     buzz        log10(comments)           — discussion signal
+     freshness   exp decay (~36 h)         — newer wins ties
+     media type  video > gallery > image   — it's a video app
+     jitter      seeded random             — so every refresh reshuffles
+   Slides are then picked greedily by score with one constraint: avoid two
+   consecutive posts from the same subreddit (diversity interleave).
+   Refresh re-seeds the jitter AND rotates each sub between hot / top(day) /
+   rising / top(week), so refreshed feeds contain genuinely different posts.
+   ======================================================================= */
+function hashStr(s) {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+}
+function seededRand(seed) {
+  let a = seed | 0;
+  a = a + 0x6D2B79F5 | 0;
+  let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+  return ((t ^ t >>> 14) >>> 0) / 4294967296;
+}
+function scorePost(p, seed) {
+  const hours = Math.max(0, (Date.now() / 1000 - (p.created_utc || 0)) / 3600);
+  const freshness = Math.exp(-hours / 36);
+  const popularity = Math.log10((p.ups || 0) + 1);
+  const buzz = Math.log10((p.num_comments || 0) + 1);
+  const type = p.is_video ? 1.6 : (p.is_gallery ? 0.9 : 0.5);
+  const jitter = seededRand(seed ^ hashStr(p.id));
+  return popularity * 0.9 + buzz * 0.5 + freshness * 2.2 + type + jitter * 1.5;
+}
+function pickBatch(buffer, seed, n) {
+  const scored = buffer
+    .map(p => ({ p, s: scorePost(p, seed) }))
+    .sort((a, b) => b.s - a.s);
+  const out = [];
+  let lastSub = null;
+  while (out.length < n && scored.length) {
+    let idx = scored.findIndex(x => x.p.subreddit !== lastSub);
+    if (idx === -1) idx = 0;                    // only one sub left — allow repeats
+    const [pick] = scored.splice(idx, 1);
+    out.push(pick.p);
+    lastSub = pick.p.subreddit;
+  }
+  // remove picked posts from the buffer
+  const taken = new Set(out.map(p => p.id));
+  for (let i = buffer.length - 1; i >= 0; i--) if (taken.has(buffer[i].id)) buffer.splice(i, 1);
+  return out;
+}
+
+function randomSortPlan() {
+  const plan = {};
+  for (const s of subs) plan[s] = SORTS[(Math.random() * SORTS.length) | 0];
+  return plan;
+}
+
+async function ensureBuffer() {
+  if (my.fetching || my.buffer.length >= MIN_BUFFER) return;
+  const pending = subs.filter(s => my.afters[s] !== null); // null = exhausted
+  if (pending.length === 0) return;
+  my.fetching = true;
+  try {
+    const results = await Promise.allSettled(pending.map(async sub => {
+      const [sort, t] = my.sorts[sub] || ['hot', null];
+      const data = await fetchSubPage(sub, sort, t, my.afters[sub]);
+      my.afters[sub] = data.data.after || null;
+      my.buffer.push(...usablePosts(data));
+    }));
+    const failures = results.filter(r => r.status === 'rejected');
+    if (failures.length === pending.length) throw failures[0].reason;
+  } finally {
+    my.fetching = false;
+  }
+}
+
+async function myLoadMore() {
+  if (loading) return;
   loading = true;
   try {
-    const data = await fetchPage(currentSub, after);
-    after = data.data.after;
-    if (!after) exhausted = true;
-
-    let added = 0;
-    for (const child of data.data.children) {
-      const post = child.data;
-      if (post.stickied || post.over_18 || seen.has(post.id)) continue;
+    await ensureBuffer();
+    const batch = pickBatch(my.buffer, my.seed, BATCH_SIZE);
+    for (const post of batch) {
       const slide = buildSlide(post);
-      if (slide) { feed.appendChild(slide); seen.add(post.id); added++; }
+      if (slide) feed.appendChild(slide);
+    }
+    if (feed.children.length > 0) hideStatus();
+    else if (subs.every(s => my.afters[s] === null)) {
+      showStatus('No playable posts found in your subreddits — edit the list with ＋', false);
+    }
+    ensureBuffer(); // fire-and-forget refill for the next batch
+  } catch (err) {
+    console.error(err);
+    if (feed.children.length === 0) showStatus('Could not load your feed — ' + err.message, false);
+  } finally {
+    loading = false;
+  }
+}
+
+function enterMyFeed(reset) {
+  mode = 'my';
+  currentSub = null;
+  if (reset) {
+    my.seed = (Math.random() * 2 ** 31) | 0;
+    my.sorts = randomSortPlan();
+    my.buffer = [];
+    my.afters = {};
+    seen.clear();
+    feed.replaceChildren();
+    feed.scrollTop = 0;
+  }
+  highlightChip('my');
+  showStatus('Mixing your feed…');
+  myLoadMore();
+}
+
+/* =======================================================================
+   SINGLE SUBREDDIT MODE
+   ======================================================================= */
+async function subLoadMore() {
+  if (loading || subExhausted) return;
+  loading = true;
+  try {
+    const [sort, t] = SORTS[subSortIdx];
+    const data = await fetchSubPage(currentSub, sort, t, subAfter);
+    subAfter = data.data.after;
+    if (!subAfter) subExhausted = true;
+    let added = 0;
+    for (const post of usablePosts(data)) {
+      const slide = buildSlide(post);
+      if (slide) { feed.appendChild(slide); added++; }
     }
     hideStatus();
-    if (added === 0 && !exhausted) { loading = false; return loadMore(); }
+    if (added === 0 && !subExhausted) { loading = false; return subLoadMore(); }
     if (feed.children.length === 0) {
       showStatus('No playable video/image posts found in r/' + currentSub, false);
     }
   } catch (err) {
     console.error(err);
     if (feed.children.length === 0) {
-      showStatus('Could not load r/' + currentSub + ' — ' + err.message +
-                 '. Reddit sometimes rate-limits; wait a moment or pick another subreddit.', false);
+      showStatus('Could not load r/' + currentSub + ' — ' + err.message, false);
     }
   } finally {
     loading = false;
   }
 }
 
-/* ---------- slide builders ---------- */
+function enterSub(sub, resetSort) {
+  mode = 'sub';
+  currentSub = sub;
+  if (resetSort) subSortIdx = 0;
+  subAfter = null;
+  subExhausted = false;
+  seen.clear();
+  feed.replaceChildren();
+  feed.scrollTop = 0;
+  highlightChip(sub);
+  const [sort, t] = SORTS[subSortIdx];
+  showStatus(`Loading r/${sub} (${sort}${t ? ' · ' + t : ''})…`);
+  subLoadMore();
+}
+
+/* ---------- refresh: new content, new order ---------- */
+function refresh() {
+  if (mode === 'my') {
+    enterMyFeed(true);
+  } else {
+    subSortIdx = (subSortIdx + 1) % SORTS.length;   // hot → top(day) → rising → top(week)
+    enterSub(currentSub, false);
+  }
+}
+
+function loadMore() { mode === 'my' ? myLoadMore() : subLoadMore(); }
+
+/* =======================================================================
+   TOP BAR + SUBREDDIT EDITOR
+   ======================================================================= */
+function rebuildTopbar() {
+  topbar.replaceChildren();
+  const myChip = el('button', 'chip', '⭐ My Feed');
+  myChip.dataset.key = 'my';
+  myChip.onclick = () => { if (mode !== 'my') enterMyFeed(true); };
+  topbar.appendChild(myChip);
+
+  for (const sub of subs) {
+    const b = el('button', 'chip', 'r/' + sub);
+    b.dataset.key = sub;
+    b.onclick = () => { if (!(mode === 'sub' && currentSub === sub)) enterSub(sub, true); };
+    topbar.appendChild(b);
+  }
+
+  const edit = el('button', 'chip', '＋');
+  edit.title = 'Edit subreddits';
+  edit.onclick = openEditor;
+  topbar.appendChild(edit);
+
+  highlightChip(mode === 'my' ? 'my' : currentSub);
+}
+function highlightChip(key) {
+  document.querySelectorAll('.chip').forEach(c =>
+    c.classList.toggle('active', c.dataset.key === key));
+}
+
+function openEditor() {
+  const overlay = el('div', 'editor-overlay');
+  const card = el('div', 'editor-card');
+  card.appendChild(el('div', 'editor-title', 'My Feed subreddits'));
+
+  const list = el('div', 'editor-list');
+  const renderList = () => {
+    list.replaceChildren();
+    for (const sub of subs) {
+      const row = el('div', 'editor-row');
+      row.appendChild(el('span', null, 'r/' + sub));
+      const rm = el('button', 'editor-remove', '✕');
+      rm.onclick = () => {
+        if (subs.length === 1) return alert('Keep at least one subreddit');
+        subs = subs.filter(s => s !== sub);
+        renderList();
+      };
+      row.appendChild(rm);
+      list.appendChild(row);
+    }
+  };
+  renderList();
+  card.appendChild(list);
+
+  const addRow = el('div', 'editor-add');
+  const input = document.createElement('input');
+  input.placeholder = 'add subreddit, e.g. r/space';
+  input.autocapitalize = 'none';
+  const addBtn = el('button', 'editor-btn', 'Add');
+  const add = () => {
+    const name = input.value.trim().replace(/^\/?(r\/)?/i, '');
+    if (!/^[A-Za-z0-9_]{2,21}$/.test(name)) return alert('That does not look like a subreddit name');
+    if (!subs.some(s => s.toLowerCase() === name.toLowerCase())) subs.push(name);
+    input.value = '';
+    renderList();
+  };
+  addBtn.onclick = add;
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') add(); });
+  addRow.appendChild(input);
+  addRow.appendChild(addBtn);
+  card.appendChild(addRow);
+
+  const done = el('button', 'editor-btn editor-done', 'Done');
+  done.onclick = () => {
+    saveSubs();
+    overlay.remove();
+    rebuildTopbar();
+    if (mode === 'sub' && !subs.includes(currentSub)) enterMyFeed(true);
+    else if (mode === 'my') enterMyFeed(true);
+  };
+  card.appendChild(done);
+
+  overlay.appendChild(card);
+  overlay.addEventListener('click', e => { if (e.target === overlay) done.onclick(); });
+  document.body.appendChild(overlay);
+  input.focus();
+}
+
+/* =======================================================================
+   STATUS
+   ======================================================================= */
+function showStatus(msg, spin = true) {
+  statusEl.classList.remove('hidden');
+  statusEl.querySelector('.spinner').style.display = spin ? '' : 'none';
+  statusText.textContent = msg;
+}
+function hideStatus() { statusEl.classList.add('hidden'); }
+statusEl.addEventListener('click', () => {
+  if (!loading && feed.children.length === 0) {
+    showStatus('Retrying…');
+    loadMore();
+  }
+});
+
+/* =======================================================================
+   SLIDE BUILDERS
+   ======================================================================= */
 function buildSlide(post) {
   if (post.is_video && post.media && post.media.reddit_video) return videoSlide(post);
   if (post.is_gallery && post.media_metadata) return gallerySlide(post);
@@ -236,7 +454,9 @@ function videoSlide(post) {
   v.playsInline = true;
   v.muted = true;
   v.loop = true;
-  v.preload = 'metadata';
+  // preload nothing by default — the warm-up observer upgrades the current and
+  // next few slides to preload=auto so they don't all fight for bandwidth.
+  v.preload = 'none';
   v.poster = posterOf(post) || '';
 
   // Safari plays HLS natively (with sound); everywhere else use the mp4
@@ -272,6 +492,16 @@ function videoSlide(post) {
   s._video = v;
 
   s.appendChild(el('div', 'paused-badge', '▶'));
+
+  // buffering spinner — visible whenever the video is stalled waiting for data
+  const buf = el('div', 'buffer-spinner');
+  buf.appendChild(el('div', 'spinner'));
+  s.appendChild(buf);
+  const setBuffering = on => s.classList.toggle('buffering', on);
+  v.addEventListener('waiting', () => setBuffering(true));
+  v.addEventListener('stalled', () => setBuffering(true));
+  v.addEventListener('playing', () => setBuffering(false));
+  v.addEventListener('canplay', () => setBuffering(false));
 
   // sound toggle in the rail
   const rail = s.querySelector('.rail');
@@ -346,7 +576,6 @@ function gallerySlide(post) {
   bd.style.backgroundImage = `url("${urls[0]}")`;
   s.prepend(bd);
 
-  // dots
   const dots = el('div', 'dots');
   urls.forEach((_, i) => {
     const d = el('span');
@@ -388,7 +617,10 @@ function imageSlide(post) {
   return s;
 }
 
-/* ---------- autoplay via IntersectionObserver ---------- */
+/* =======================================================================
+   AUTOPLAY + PRELOADING
+   ======================================================================= */
+// play/pause exactly the on-screen video
 const io = new IntersectionObserver(entries => {
   for (const e of entries) {
     const s = e.target;
@@ -404,9 +636,27 @@ const io = new IntersectionObserver(entries => {
   }
 }, { threshold: [0, 0.6] });
 
-// observe every slide added to the feed + infinite scroll trigger
+// warm-up: when a slide is within ~1.5 screens of the viewport, start
+// downloading its video so it plays instantly when swiped to.
+const warmIO = new IntersectionObserver(entries => {
+  for (const e of entries) {
+    const v = e.target._video;
+    if (!v) continue;
+    if (e.isIntersecting && v.preload !== 'auto') {
+      v.preload = 'auto';
+      // load() resets the element (and would cancel a play() in flight),
+      // so only kick it for videos that haven't started fetching at all
+      if (v.networkState === HTMLMediaElement.NETWORK_EMPTY) v.load();
+    }
+  }
+}, { rootMargin: '250% 0px 250% 0px', threshold: 0 });
+
 new MutationObserver(muts => {
-  for (const m of muts) for (const n of m.addedNodes) if (n.classList) io.observe(n);
+  for (const m of muts) for (const n of m.addedNodes) {
+    if (!n.classList) continue;
+    io.observe(n);
+    warmIO.observe(n);
+  }
 }).observe(feed, { childList: true });
 
 feed.addEventListener('scroll', () => {
@@ -414,14 +664,65 @@ feed.addEventListener('scroll', () => {
   if (remaining < window.innerHeight * LOAD_MORE_AT) loadMore();
 }, { passive: true });
 
-// tap the error screen to retry
-statusEl.addEventListener('click', () => {
-  if (!loading && feed.children.length === 0) {
-    showStatus('Loading r/' + currentSub + '…');
-    loadMore();
+/* =======================================================================
+   FLOATING REFRESH BUTTON
+   ======================================================================= */
+const refreshBtn = el('button', 'refresh-btn', '🔄');
+refreshBtn.title = 'Refresh — reshuffle and pull different content';
+refreshBtn.onclick = refresh;
+document.body.appendChild(refreshBtn);
+
+/* =======================================================================
+   DEMO MODE (?demo in the URL) — sample media, no Reddit needed
+   ======================================================================= */
+const DEMO_VIDEOS = [
+  'https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4',
+  'https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/720/Big_Buck_Bunny_720_10s_5MB.mp4',
+  'https://test-videos.co.uk/vids/jellyfish/mp4/h264/720/Jellyfish_720_10s_5MB.mp4',
+  'https://test-videos.co.uk/vids/sintel/mp4/h264/720/Sintel_720_10s_5MB.mp4',
+];
+
+let demoCount = 0;
+function demoPage(cursor) {
+  const children = [];
+  for (let i = 0; i < 8; i++) {
+    const n = demoCount++;
+    const kind = n % 3; // rotate: video, gallery, image
+    const base = {
+      id: 'demo' + n, subreddit: 'demo' + (n % 3), author: 'sample',
+      ups: 1200 + n * 137, num_comments: 45 + n * 7,
+      created_utc: Date.now() / 1000 - n * 3600,
+      permalink: '/r/demo/', stickied: false, over_18: false,
+    };
+    if (kind === 0) {
+      children.push({ data: { ...base,
+        title: `Demo video #${n} — swipe up for the next one`,
+        is_video: true,
+        media: { reddit_video: { fallback_url: DEMO_VIDEOS[n % DEMO_VIDEOS.length], has_audio: true } },
+      }});
+    } else if (kind === 1) {
+      const ids = [0, 1, 2, 3].map(j => 'g' + n + j);
+      const meta = {};
+      for (const id of ids) {
+        meta[id] = { status: 'valid', s: { u: `https://picsum.photos/seed/${id}/900/1600` } };
+      }
+      children.push({ data: { ...base,
+        title: `Demo gallery #${n} — swipe RIGHT through the pictures`,
+        is_gallery: true,
+        gallery_data: { items: ids.map(id => ({ media_id: id })) },
+        media_metadata: meta,
+      }});
+    } else {
+      children.push({ data: { ...base,
+        title: `Demo photo #${n}`,
+        url: `https://picsum.photos/seed/img${n}/900/1600.jpg`,
+        post_hint: 'image',
+      }});
+    }
   }
-});
+  return { data: { after: 'demo-cursor-' + demoCount, children } };
+}
 
 /* ---------- go ---------- */
-showStatus('Loading r/' + currentSub + '…');
-loadMore();
+rebuildTopbar();
+enterMyFeed(true);

@@ -50,9 +50,22 @@ Open **http://localhost:8734** — real subreddit feeds now load.
 Free tier is 100 requests/min, way more than this app uses (responses are
 also cached for 60 s).
 
-## Pick your subreddits
+## My Feed, refresh, and picking subreddits
 
-Edit the `SUBREDDITS` list at the top of the `<script>` in `index.html`.
+- **⭐ My Feed** (default view) mixes all your subreddits into one ranked feed:
+  posts are scored by upvotes, comments, freshness, and media type (videos
+  first), with a diversity rule so two consecutive posts never come from the
+  same subreddit.
+- **🔄 refresh** (bottom-left) reshuffles the ranking AND rotates each
+  subreddit between hot / top-of-day / rising / top-of-week, so you get
+  genuinely different content every time.
+- **＋** in the top bar opens the subreddit editor — add or remove any
+  subreddit; your list is saved in the browser (localStorage).
+- Tapping a subreddit chip shows just that sub; refreshing there cycles
+  hot → top(day) → rising → top(week).
+
+Videos only preload when they're within a couple of swipes of the screen
+(instead of all at once), and a spinner shows while a video is buffering.
 
 ## Deploy to the internet (free)
 

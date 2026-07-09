@@ -53,9 +53,16 @@ export default {
     const afterParam = u.searchParams.get('after');
     if (!sub) return new Response(JSON.stringify({ error: 'missing ?sub=' }), { status: 400, headers: cors });
 
+    const SORTS = new Set(['hot', 'new', 'rising', 'top']);
+    const TIMES = new Set(['hour', 'day', 'week', 'month', 'year', 'all']);
+    let sort = u.searchParams.get('sort') || 'hot';
+    if (!SORTS.has(sort)) sort = 'hot';
+    const t = u.searchParams.get('t');
+
     try {
-      const api = `https://oauth.reddit.com/r/${encodeURIComponent(sub)}/hot?raw_json=1&limit=${limit}` +
-                  (afterParam ? `&after=${encodeURIComponent(afterParam)}` : '');
+      const api = `https://oauth.reddit.com/r/${encodeURIComponent(sub)}/${sort}?raw_json=1&limit=${limit}` +
+                  (afterParam ? `&after=${encodeURIComponent(afterParam)}` : '') +
+                  (t && TIMES.has(t) ? `&t=${t}` : '');
       const res = await fetch(api, {
         headers: {
           'Authorization': 'Bearer ' + await getToken(env),
