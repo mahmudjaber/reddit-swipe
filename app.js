@@ -239,14 +239,23 @@ function videoSlide(post) {
   v.preload = 'metadata';
   v.poster = posterOf(post) || '';
 
-  // iOS Safari plays HLS natively (with sound); everywhere else use the mp4
+  // Safari plays HLS natively (with sound); everywhere else use the mp4
   // fallback (video-only) plus a synced <audio> element for sound.
-  const canHls = v.canPlayType('application/vnd.apple.mpegurl');
-  if (canHls && rv.hls_url) {
+  // NB: don't trust canPlayType('application/vnd.apple.mpegurl') — Chrome
+  // answers "maybe" but can't actually play HLS, leaving a frozen poster.
+  const ua = navigator.userAgent;
+  const isSafari = /iPhone|iPad|iPod/.test(ua) ||
+                   (/Safari\//.test(ua) && !/Chrome|Chromium|Edg\/|OPR\//.test(ua));
+  if (isSafari && rv.hls_url) {
     v.src = rv.hls_url;
+  } else if (rv.is_gif || rv.has_audio === false) {
+    v.src = rv.fallback_url;   // no audio track exists — video alone
   } else {
     v.src = rv.fallback_url;
-    const audioUrl = rv.fallback_url.replace(/DASH_\d+/, 'DASH_AUDIO_128');
+    // reddit serves video & audio separately; both old (DASH_*) and new (CMAF_*) naming
+    const audioUrl = rv.fallback_url
+      .replace(/CMAF_\d+/, 'CMAF_AUDIO_128')
+      .replace(/DASH_\d+/, 'DASH_AUDIO_128');
     const a = document.createElement('audio');
     a.src = audioUrl;
     a.preload = 'none';
