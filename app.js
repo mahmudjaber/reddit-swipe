@@ -1,4 +1,4 @@
-const APP_VERSION = '1.10.0';   // shown in the ＋ editor — bump with manifest.json
+const APP_VERSION = '1.11.0';   // shown in the ＋ editor — bump with manifest.json
 
 /* ================= CONFIG ================= */
 // Default subreddits for first launch — after that, edit your list in the app
@@ -174,13 +174,42 @@ function usablePosts(data, skipShown) {
     if (post.stickied || seen.has(post.id)) continue;
     if (skipShown && shownIds.has(post.id)) continue;
     if (post.over_18 && !showNsfw) continue;
+    // redgifs: reddit's rehosted preview is always video-only; remember the id
+    // so the slide can fetch the original (which has the audio) instead
+    const rg = (post.url || '').match(/redgifs\.com\/(?:watch|ifr)\/([a-z0-9]+)/i);
+    if (rg) post._redgifs = rg[1].toLowerCase();
     const rv = videoInfoOf(post);       // prefer motion: a .gif still gets played as video
     if (rv) post._rv = rv;
+    else if (post._redgifs) post._rv = {};   // no preview rehost — original only
     else if (!(post.is_gallery && post.media_metadata) && !isDirectImage(post)) continue;
     seen.add(post.id);
     out.push(post);
   }
   return out;
+}
+
+/* ---------- redgifs original resolution (extension only — needs host perm) ---------- */
+let rgToken = null;
+const rgCache = new Map();
+async function resolveRedgifs(id) {
+  if (rgCache.has(id)) return rgCache.get(id);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (!rgToken) {
+      const r = await politeFetch('https://api.redgifs.com/v2/auth/temporary');
+      rgToken = (await r.json()).token;
+    }
+    const r = await politeFetch('https://api.redgifs.com/v2/gifs/' + encodeURIComponent(id), {
+      headers: { Authorization: 'Bearer ' + rgToken },
+    });
+    if (r.status === 401) { rgToken = null; continue; }   // token expired — retry once
+    if (!r.ok) break;
+    const j = await r.json();
+    const url = (j && j.gif && j.gif.urls && (j.gif.urls.hd || j.gif.urls.sd)) || null;
+    rgCache.set(id, url);
+    return url;
+  }
+  rgCache.set(id, null);
+  return null;
 }
 
 /* =======================================================================
@@ -706,7 +735,17 @@ function videoSlide(post) {
   // Reddit's is_gif/has_audio metadata is unreliable in BOTH directions, so it
   // never decides routing: anything with an HLS stream goes through HLS, which
   // carries the audio whenever the source has any.
-  if (isSafari && rv.hls_url) {
+  if (post._redgifs && EXTENSION) {
+    // reddit's rehost of redgifs is video-only — fetch the original, which
+    // is a plain mp4 with the audio muxed in
+    s._path = 'redgifs';
+    resolveRedgifs(post._redgifs).then(url => {
+      if (!url) return;
+      v.src = url;
+      const r = s.getBoundingClientRect();
+      if (r.top < innerHeight * 0.5 && r.bottom > innerHeight * 0.5) v.play().catch(() => {});
+    }).catch(() => {});
+  } else if (isSafari && rv.hls_url) {
     s._path = 'native-hls';
     v.src = rv.hls_url;        // native HLS — audio is muxed in
   } else if (rv.hls_url && window.Hls && Hls.isSupported()) {
