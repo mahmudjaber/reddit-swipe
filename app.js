@@ -627,17 +627,31 @@ function videoSlide(post) {
   const isSafari = /iPhone|iPad|iPod/.test(ua) ||
                    (/Safari\//.test(ua) && !/Chrome|Chromium|Edg\/|OPR\//.test(ua));
   if (isSafari && rv.hls_url) {
-    v.src = rv.hls_url;
+    v.src = rv.hls_url;        // native HLS — audio is muxed in
+  } else if (rv.hls_url && window.Hls && Hls.isSupported() && !rv.is_gif && rv.has_audio !== false) {
+    // hls.js — audio muxed in, adaptive bitrate for smoother buffering.
+    // Attached lazily by the warm-up observer so off-screen slides cost nothing.
+    s._hlsUrl = rv.hls_url;
   } else if (rv.is_gif || rv.has_audio === false) {
     v.src = rv.fallback_url;   // no audio track exists — video alone
   } else {
+    // last resort: bare mp4 (video-only) + separate audio element. Reddit's
+    // audio filename varies by transcoding era, so walk the candidates until
+    // one loads.
     v.src = rv.fallback_url;
-    // reddit serves video & audio separately; both old (DASH_*) and new (CMAF_*) naming
-    const audioUrl = rv.fallback_url
-      .replace(/CMAF_\d+/, 'CMAF_AUDIO_128')
-      .replace(/DASH_\d+/, 'DASH_AUDIO_128');
+    const cut = rv.fallback_url.indexOf('?');
+    const query = cut >= 0 ? rv.fallback_url.slice(cut) : '';
+    const base = rv.fallback_url.slice(0, rv.fallback_url.lastIndexOf('/'));
+    const AUDIO_NAMES = ['CMAF_AUDIO_128.mp4', 'CMAF_AUDIO_64.mp4', 'DASH_AUDIO_128.mp4',
+                         'DASH_AUDIO_64.mp4', 'DASH_audio.mp4', 'audio.mp4'];
+    let ai = 0;
     const a = document.createElement('audio');
-    a.src = audioUrl;
+    a.src = base + '/' + AUDIO_NAMES[ai] + query;
+    a.addEventListener('error', () => {
+      if (++ai >= AUDIO_NAMES.length) return;
+      a.src = base + '/' + AUDIO_NAMES[ai] + query;
+      if (soundOn && !v.paused) { a.currentTime = v.currentTime; a.play().catch(() => {}); }
+    });
     a.preload = 'none';
     a.loop = true;
     s._audio = a;
@@ -674,7 +688,7 @@ function videoSlide(post) {
 
   // tap video to pause/resume
   s.addEventListener('click', () => {
-    if (v.paused) { v.play().catch(() => {}); s.classList.remove('paused'); }
+    if (v.paused) { attachHls(s); v.play().catch(() => {}); s.classList.remove('paused'); }
     else { v.pause(); s.classList.add('paused'); }
   });
 
@@ -780,6 +794,22 @@ function imageSlide(post) {
 /* =======================================================================
    AUTOPLAY + PRELOADING
    ======================================================================= */
+function attachHls(s) {
+  if (!s._hlsUrl || s._hls) return;
+  const h = new Hls({
+    capLevelToPlayerSize: true,   // don't pull 1080p for a phone-sized viewport
+    maxBufferLength: 15,          // seconds ahead — enough for smooth play,
+    backBufferLength: 10,         // small enough to not hog memory/bandwidth
+  });
+  h.loadSource(s._hlsUrl);
+  h.attachMedia(s._video);
+  s._hls = h;
+  s._video.muted = !soundOn;
+}
+function detachHls(s) {
+  if (s._hls) { s._hls.destroy(); s._hls = null; }
+}
+
 // play/pause exactly the on-screen video
 const io = new IntersectionObserver(entries => {
   for (const e of entries) {
@@ -787,6 +817,8 @@ const io = new IntersectionObserver(entries => {
     if (!s._video) continue;
     if (e.isIntersecting && e.intersectionRatio >= 0.6) {
       s.classList.remove('paused');
+      attachHls(s);
+      if (!s._audio) s._video.muted = !soundOn;   // hls/native slides follow global sound
       s._video.play().catch(() => {});
     } else {
       s._video.pause();
@@ -796,17 +828,25 @@ const io = new IntersectionObserver(entries => {
   }
 }, { threshold: [0, 0.6] });
 
-// warm-up: when a slide is within ~1.5 screens of the viewport, start
-// downloading its video so it plays instantly when swiped to.
+// warm-up: when a slide is within ~2.5 screens of the viewport, start
+// downloading its video so it plays instantly when swiped to; when it
+// drifts far away again, tear the hls instance down to free memory.
 const warmIO = new IntersectionObserver(entries => {
   for (const e of entries) {
-    const v = e.target._video;
+    const s = e.target;
+    const v = s._video;
     if (!v) continue;
-    if (e.isIntersecting && v.preload !== 'auto') {
-      v.preload = 'auto';
-      // load() resets the element (and would cancel a play() in flight),
-      // so only kick it for videos that haven't started fetching at all
-      if (v.networkState === HTMLMediaElement.NETWORK_EMPTY) v.load();
+    if (e.isIntersecting) {
+      if (s._hlsUrl) {
+        attachHls(s);
+      } else if (v.preload !== 'auto') {
+        v.preload = 'auto';
+        // load() resets the element (and would cancel a play() in flight),
+        // so only kick it for videos that haven't started fetching at all
+        if (v.networkState === HTMLMediaElement.NETWORK_EMPTY) v.load();
+      }
+    } else {
+      detachHls(s);
     }
   }
 }, { rootMargin: '250% 0px 250% 0px', threshold: 0 });
