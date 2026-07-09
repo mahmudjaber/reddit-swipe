@@ -70,29 +70,75 @@ function el(tag, className, text) {
 
 /* =======================================================================
    FETCHING
+   -----------------------------------------------------------------------
+   Reddit rate-limits bursts (HTTP 429). All requests go through a polite
+   queue: max 2 in flight, spaced apart, one automatic wait-and-retry on
+   429 honoring Retry-After. Fetched pages are cached for 5 minutes so
+   chip-hopping and buffer refills don't refetch the same listing.
    ======================================================================= */
+const fetchQueue = [];
+let activeFetches = 0;
+const MAX_CONCURRENT = 2;
+const SPACING_MS = 400;
+
+function politeFetch(url, opts) {
+  return new Promise((resolve, reject) => {
+    fetchQueue.push({ url, opts, resolve, reject });
+    pumpQueue();
+  });
+}
+async function pumpQueue() {
+  if (activeFetches >= MAX_CONCURRENT || fetchQueue.length === 0) return;
+  const job = fetchQueue.shift();
+  activeFetches++;
+  try {
+    let res = await fetch(job.url, job.opts);
+    if (res.status === 429) {
+      const wait = Math.min(parseInt(res.headers.get('retry-after'), 10) || 15, 60);
+      if (feed.children.length === 0) {
+        showStatus(`Reddit rate limit — retrying in ${wait}s…`);
+      }
+      await new Promise(r => setTimeout(r, wait * 1000));
+      res = await fetch(job.url, job.opts);
+    }
+    job.resolve(res);
+  } catch (e) {
+    job.reject(e);
+  } finally {
+    activeFetches--;
+    setTimeout(pumpQueue, SPACING_MS);
+  }
+}
+
+const pageCache = new Map();   // url -> { json, at }
+const PAGE_CACHE_MS = 5 * 60_000;
+
 async function fetchSubPage(sub, sort, t, cursor) {
   if (DEMO) return demoPage(cursor);
   const qs = `limit=${PAGE_SIZE}&raw_json=1` +
              (cursor ? `&after=${encodeURIComponent(cursor)}` : '') +
              (t ? `&t=${t}` : '');
-  let res;
-  if (EXTENSION) {
-    res = await fetch(`https://www.reddit.com/r/${encodeURIComponent(sub)}/${sort}.json?${qs}`,
-                      { credentials: 'include' });
-    if (!res.ok) {
+  const url = EXTENSION
+    ? `https://www.reddit.com/r/${encodeURIComponent(sub)}/${sort}.json?${qs}`
+    : `${API_BASE}/api/feed?sub=${encodeURIComponent(sub)}&sort=${sort}&${qs}`;
+
+  const cached = pageCache.get(url);
+  if (cached && Date.now() - cached.at < PAGE_CACHE_MS) return cached.json;
+
+  const res = await politeFetch(url, EXTENSION ? { credentials: 'include' } : undefined);
+  if (!res.ok) {
+    if (EXTENSION) {
       throw new Error('Reddit responded HTTP ' + res.status +
-        (res.status === 403 ? ' — open reddit.com in another tab (log in), then tap here to retry' : ''));
+        (res.status === 403 ? ' — open reddit.com in another tab (log in), then tap here to retry' :
+         res.status === 429 ? ' — rate limited; wait a minute, then tap here to retry' : ''));
     }
-  } else {
-    res = await fetch(`${API_BASE}/api/feed?sub=${encodeURIComponent(sub)}&sort=${sort}&${qs}`);
-    if (!res.ok) {
-      let msg = 'proxy responded ' + res.status;
-      try { const e = await res.json(); if (e.error) msg = e.error; } catch {}
-      throw new Error(msg);
-    }
+    let msg = 'proxy responded ' + res.status;
+    try { const e = await res.json(); if (e.error) msg = e.error; } catch {}
+    throw new Error(msg);
   }
-  return res.json();
+  const json = await res.json();
+  pageCache.set(url, { json, at: Date.now() });
+  return json;
 }
 
 function usablePosts(data) {
