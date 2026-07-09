@@ -1,4 +1,4 @@
-const APP_VERSION = '1.7.0';   // shown in the ＋ editor — bump with manifest.json
+const APP_VERSION = '1.8.0';   // shown in the ＋ editor — bump with manifest.json
 
 /* ================= CONFIG ================= */
 // Default subreddits for first launch — after that, edit your list in the app
@@ -157,8 +157,10 @@ function videoInfoOf(post) {
   if (post.media && post.media.reddit_video) return post.media.reddit_video;
   const xp = post.crosspost_parent_list && post.crosspost_parent_list[0];
   if (xp && xp.media && xp.media.reddit_video) return xp.media.reddit_video;
+  // trust the preview's own is_gif/has_audio — many of these are real videos
+  // with sound (external videos rehosted by reddit), not gifs
   const rvp = post.preview && post.preview.reddit_video_preview;
-  if (rvp && rvp.fallback_url) return { ...rvp, has_audio: false, is_gif: true };
+  if (rvp && rvp.fallback_url) return rvp;
   if (/\.gifv$/i.test(post.url || '')) {
     return { fallback_url: post.url.replace(/\.gifv$/i, '.mp4'), has_audio: false, is_gif: true };
   }
@@ -660,6 +662,13 @@ function fmt(n) {
 }
 
 /* ----- video ----- */
+function setBadge(s, text) {
+  let b = s.querySelector('.type-badge');
+  if (!text) { if (b) b.remove(); return; }
+  if (b) b.textContent = text;
+  else s.appendChild(el('div', 'type-badge', text));
+}
+
 function videoSlide(post) {
   const rv = post._rv || post.media.reddit_video;
   const noAudio = !!(rv.is_gif || rv.has_audio === false);
@@ -727,6 +736,17 @@ function videoSlide(post) {
   s._video = v;
 
   s.appendChild(el('div', 'paused-badge', '▶'));
+
+  // reddit's audio metadata lies both ways — verify against what's actually
+  // being decoded and correct the badge accordingly
+  v.addEventListener('playing', () => {
+    clearTimeout(s._audChk);
+    s._audChk = setTimeout(() => {
+      if (v.paused || s._audio || v.webkitAudioDecodedByteCount === undefined) return;
+      if (v.webkitAudioDecodedByteCount > 0) setBadge(s, null);          // it has sound
+      else setBadge(s, '🔇 no sound in this video');
+    }, 1800);
+  });
 
   // buffering spinner — visible whenever the video is stalled waiting for data
   const buf = el('div', 'buffer-spinner');
