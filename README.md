@@ -14,7 +14,24 @@ node server.js
 Open **http://localhost:8734/?demo** — demo mode uses sample videos and images
 so you can feel the swiping UX immediately.
 
-## Live Reddit feeds
+## Live Reddit feeds today — Chrome extension (no API approval needed)
+
+This folder doubles as a Chrome extension. As an extension it fetches
+reddit.com directly with **your own logged-in browser session** — a personal
+read-only viewer, so no Data API credentials are required:
+
+1. Open `chrome://extensions` in Chrome
+2. Turn on **Developer mode** (top-right toggle)
+3. Click **Load unpacked** and select this folder
+4. Click the Reddit Swipe icon in the toolbar (pin it via the puzzle icon)
+
+If feeds show a 403, open reddit.com in another tab once (so you're logged
+in / past Reddit's bot check), then tap the error screen to retry.
+
+Note: desktop Chrome/Edge/Brave only — iOS Safari and Chrome for Android
+don't support extensions (Firefox for Android does, with minor tweaks).
+
+## Live Reddit feeds as a website (needs Reddit Data API approval)
 
 Reddit killed anonymous API access in 2023 (no CORS + bot fingerprinting), so
 the page can't call reddit.com directly from the browser — a tiny proxy does
