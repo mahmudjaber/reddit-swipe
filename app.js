@@ -1,4 +1,4 @@
-const APP_VERSION = '1.17.0';   // shown in the ＋ editor — bump with manifest.json
+const APP_VERSION = '1.18.0';   // shown in the ＋ editor — bump with manifest.json
 
 /* ================= CONFIG ================= */
 // Default subreddits for first launch — after that, edit your list in the app
@@ -405,7 +405,9 @@ async function resolveRedgifs(id) {
     if (r.status === 401) { rgToken = null; continue; }   // token expired — retry once
     if (!r.ok) break;
     const j = await r.json();
-    const url = (j && j.gif && j.gif.urls && (j.gif.urls.hd || j.gif.urls.sd)) || null;
+    // SD first: on a swipe feed, time-to-first-frame beats resolution — HD
+    // files run 10-30MB and crawl on weak connections
+    const url = (j && j.gif && j.gif.urls && (j.gif.urls.sd || j.gif.urls.hd)) || null;
     rgCache.set(id, url);
     return url;
   }
@@ -1120,6 +1122,17 @@ function videoSlide(post) {
     }, 1800);
   });
 
+  // current video comfortably ahead → hand idle bandwidth to the next slide
+  const maybePromoteNext = () => {
+    if (v.paused) return;
+    try {
+      const b = v.buffered;
+      if (b.length && b.end(b.length - 1) - v.currentTime > 10) promoteNextSlide(s);
+    } catch {}
+  };
+  v.addEventListener('progress', maybePromoteNext);
+  v.addEventListener('canplaythrough', () => { if (!v.paused) promoteNextSlide(s); });
+
   // buffering spinner — visible whenever the video is stalled waiting for data
   const buf = el('div', 'buffer-spinner');
   buf.appendChild(el('div', 'spinner'));
@@ -1260,15 +1273,23 @@ function attachHls(s) {
   const h = new Hls({
     capLevelToPlayerSize: true,   // don't pull 1080p for a phone-sized viewport
     startLevel: 0,                // first frame ASAP at low quality; ABR upgrades
+    startFragPrefetch: true,      // fetch the first fragment alongside the playlist
     maxBufferLength: WARM_BUFFER_S, // off-screen slides only grab an instant-start
                                     // buffer; promoted to FULL_BUFFER_S when current
     backBufferLength: 10,         // small enough to not hog memory/bandwidth
+    manifestLoadingTimeOut: 8000, // defaults wait ~20s before retrying — on a
+    fragLoadingTimeOut: 10000,    // flaky link, failing fast and retrying wins
     enableWorker: false,          // extension CSP blocks blob workers; hls.js's
                                   // silent fallback can kill the audio pipeline
     fLoader: makeCacheFragLoader(),  // disk-cache segments for instant rewatch
   });
   h.on(Hls.Events.ERROR, (_, d) => {
     s._hlsErr = d.type + '/' + d.details + (d.fatal ? ' FATAL' : '');
+    if (d.fatal) {
+      // self-heal instead of freezing on the poster
+      if (d.type === Hls.ErrorTypes.NETWORK_ERROR) h.startLoad();
+      else if (d.type === Hls.ErrorTypes.MEDIA_ERROR) h.recoverMediaError();
+    }
   });
   h.loadSource(s._hlsUrl);
   h.attachMedia(s._video);
@@ -1277,6 +1298,23 @@ function attachHls(s) {
 }
 function detachHls(s) {
   if (s._hls) { s._hls.destroy(); s._hls = null; }
+}
+
+// Waterfall prefetch: once the CURRENT video is comfortably buffered, spend
+// the now-idle bandwidth deepening the NEXT video instead of leaving it at
+// the minimal warm buffer — so the next swipe starts instantly.
+function promoteNextSlide(s) {
+  let next = s.nextElementSibling;
+  while (next && !next._video) next = next.nextElementSibling;   // skip stills
+  if (!next) return;
+  if (next._hlsUrl) {
+    attachHls(next);
+    if (next._hls && next._hls.config.maxBufferLength < 15) {
+      next._hls.config.maxBufferLength = 15;
+    }
+  } else if (next._mp4Url && next._video.preload !== 'auto') {
+    next._video.preload = 'auto';   // let the whole file stream down while idle
+  }
 }
 
 // play/pause exactly the on-screen video
