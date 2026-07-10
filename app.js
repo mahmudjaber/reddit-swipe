@@ -1,4 +1,4 @@
-const APP_VERSION = '1.11.0';   // shown in the ＋ editor — bump with manifest.json
+const APP_VERSION = '1.12.0';   // shown in the ＋ editor — bump with manifest.json
 
 /* ================= CONFIG ================= */
 // Default subreddits for first launch — after that, edit your list in the app
@@ -929,11 +929,20 @@ function imageSlide(post) {
 /* =======================================================================
    AUTOPLAY + PRELOADING
    ======================================================================= */
+// Bandwidth budget: the on-screen video gets deep buffering; nearby warm
+// videos only prefetch enough for an instant start, so they don't starve the
+// current video on slow connections (reddit.com feels faster because it only
+// ever downloads ONE video).
+const WARM_BUFFER_S = 6;
+const FULL_BUFFER_S = 30;
+
 function attachHls(s) {
   if (!s._hlsUrl || s._hls) return;
   const h = new Hls({
     capLevelToPlayerSize: true,   // don't pull 1080p for a phone-sized viewport
-    maxBufferLength: 15,          // seconds ahead — enough for smooth play,
+    startLevel: 0,                // first frame ASAP at low quality; ABR upgrades
+    maxBufferLength: WARM_BUFFER_S, // off-screen slides only grab an instant-start
+                                    // buffer; promoted to FULL_BUFFER_S when current
     backBufferLength: 10,         // small enough to not hog memory/bandwidth
     enableWorker: false,          // extension CSP blocks blob workers; hls.js's
                                   // silent fallback can kill the audio pipeline
@@ -958,6 +967,12 @@ const io = new IntersectionObserver(entries => {
     if (e.isIntersecting && e.intersectionRatio >= 0.6) {
       s.classList.remove('paused');
       attachHls(s);
+      // this video gets the bandwidth: deep buffer for it, starve the others
+      // back down to their instant-start buffer
+      for (const other of feed.children) {
+        if (other._hls) other._hls.config.maxBufferLength = other === s ? FULL_BUFFER_S : WARM_BUFFER_S;
+      }
+      if (s._video.preload !== 'auto') s._video.preload = 'auto';
       if (!s._audio) s._video.muted = !soundOn;   // hls/native slides follow global sound
       const p = s._video.play();
       if (p) p.catch(() => {
@@ -987,8 +1002,10 @@ const warmIO = new IntersectionObserver(entries => {
     if (e.isIntersecting) {
       if (s._hlsUrl) {
         attachHls(s);
-      } else if (v.preload !== 'auto') {
-        v.preload = 'auto';
+      } else if (v.preload === 'none') {
+        // warm mp4s fetch headers/first bytes only — full download ('auto')
+        // is reserved for the on-screen video so it never fights for bandwidth
+        v.preload = 'metadata';
         // load() resets the element (and would cancel a play() in flight),
         // so only kick it for videos that haven't started fetching at all
         if (v.networkState === HTMLMediaElement.NETWORK_EMPTY) v.load();
@@ -997,7 +1014,7 @@ const warmIO = new IntersectionObserver(entries => {
       detachHls(s);
     }
   }
-}, { rootMargin: '250% 0px 250% 0px', threshold: 0 });
+}, { rootMargin: '150% 0px 150% 0px', threshold: 0 });
 
 // WebKit (iPhone Safari/Orion) only lets a media element produce sound if a
 // play() was ever issued on it DURING a user gesture. A swipe is a gesture:
