@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Reddit Swipe",
-  "version": "1.15.0",
+  "version": "1.16.0",
   "description": "TikTok-style swipe feed for your favorite subreddits. Personal read-only viewer using your own Reddit session.",
   "action": {
     "default_title": "Open Reddit Swipe"

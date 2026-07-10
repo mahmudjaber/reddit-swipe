@@ -1,4 +1,4 @@
-const APP_VERSION = '1.15.0';   // shown in the ＋ editor — bump with manifest.json
+const APP_VERSION = '1.16.0';   // shown in the ＋ editor — bump with manifest.json
 
 /* ================= CONFIG ================= */
 // Default subreddits for first launch — after that, edit your list in the app
@@ -45,7 +45,8 @@ const PRESET_FEEDS = [
   { name: '🐾 Animals', subs: ['aww', 'AnimalsBeingBros', 'AnimalsBeingDerps', 'AnimalsBeingJerks', 'rarepuppers', 'Zoomies', 'cats', 'dogswithjobs', 'NatureIsFuckingLit'] },
   { name: '🤯 Mind-blowing', subs: ['nextfuckinglevel', 'BeAmazed', 'toptalent', 'blackmagicfuckery', 'woahdude', 'Damnthatsinteresting', 'humansaremetal'] },
   { name: '✨ Satisfying', subs: ['oddlysatisfying', 'powerwashingporn', 'ASMR', 'ArtisanVideos', 'toptalent'] },
-  { name: '🍔 Food', subs: ['FoodPorn', 'GifRecipes', 'food', 'Baking', 'Pizza'] },
+  { name: '🍔 Food', subs: ['FoodPorn', 'GifRecipes', 'food', 'Baking', 'Pizza', 'Cooking', 'DessertPorn', 'Breadit', 'BBQ', 'burgers', 'sushi', 'ramen', 'CulinaryPlating', 'StreetEatsWorld'] },
+  { name: '💪 Gym & Healthy', subs: ['GYM', 'formcheck', 'powerlifting', 'crossfit', 'bodyweightfitness', 'homegym', 'MealPrepSunday', 'EatCheapAndHealthy', 'HealthyFood', '1200isplenty', 'Volumeeating', 'nutrition'] },
   { name: '🎮 Gaming', subs: ['gaming', 'GamePhysics', 'pcmasterrace', 'IndieGaming'] },
   { name: '⚽ Sports', subs: ['sports', 'nba', 'soccer', 'formula1', 'MMA', 'TheOcho'] },
   { name: '🛠 Engineering', subs: ['EngineeringPorn', 'specializedtools', 'mechanical_gifs', 'techsupportgore', 'gadgets'] },
