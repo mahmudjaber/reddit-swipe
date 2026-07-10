@@ -1,4 +1,4 @@
-const APP_VERSION = '1.12.0';   // shown in the ＋ editor — bump with manifest.json
+const APP_VERSION = '1.13.0';   // shown in the ＋ editor — bump with manifest.json
 
 /* ================= CONFIG ================= */
 // Default subreddits for first launch — after that, edit your list in the app
@@ -148,6 +148,152 @@ async function fetchSubPage(sub, sort, t, cursor) {
   const json = await res.json();
   pageCache.set(url, { json, at: Date.now() });
   return json;
+}
+
+/* =======================================================================
+   VIDEO CACHE — Cache Storage API, LRU-evicted by video id
+   -----------------------------------------------------------------------
+   HLS: every segment the player downloads is written through, so rewatches
+   and revisits are served from disk at zero extra bandwidth. mp4/redgifs:
+   cached in the background only AFTER the video leaves the screen (never
+   competes with the playing video). v.redd.it URLs carry expiring auth
+   tokens in the query string, so cache keys are the bare path.
+   ======================================================================= */
+const VIDCACHE = 'rs-video-cache-v1';
+const VID_CACHE_CAP = 512 * 1024 * 1024;   // evict oldest videos past this
+const MP4_CACHE_MAX = 30 * 1024 * 1024;    // don't cache huge single files
+const CACHE_OK = typeof caches !== 'undefined';
+
+let vidIndex = {};                          // videoId -> { at, bytes }
+try { vidIndex = JSON.parse(localStorage.getItem('rs.vidcache')) || {}; } catch {}
+const saveVidIndex = () => { try { localStorage.setItem('rs.vidcache', JSON.stringify(vidIndex)); } catch {} };
+
+function cacheKeyOf(url) {
+  try {
+    const u = new URL(url);
+    if (u.hostname === 'v.redd.it') return 'https://v.redd.it' + u.pathname;
+  } catch {}
+  return url.split('#')[0];
+}
+function vidIdOf(url) {
+  try {
+    const u = new URL(url);
+    return u.hostname === 'v.redd.it' ? u.pathname.split('/')[1] : u.hostname + u.pathname;
+  } catch { return url; }
+}
+function cacheTotalBytes() {
+  return Object.values(vidIndex).reduce((a, e) => a + (e.bytes || 0), 0);
+}
+function fmtBytes(n) {
+  return n >= 1e9 ? (n / 1e9).toFixed(1) + ' GB' : n >= 1e6 ? (n / 1e6).toFixed(0) + ' MB' : Math.ceil(n / 1e3) + ' KB';
+}
+function bumpVidIndex(id, addBytes) {
+  const e = vidIndex[id] || (vidIndex[id] = { at: 0, bytes: 0 });
+  e.at = Date.now();
+  e.bytes += addBytes;
+  saveVidIndex();
+  if (addBytes > 0) evictVidCache();
+}
+async function evictVidCache() {
+  let total = cacheTotalBytes();
+  if (total <= VID_CACHE_CAP) return;
+  const cache = await caches.open(VIDCACHE);
+  const keys = await cache.keys();
+  const oldest = Object.keys(vidIndex).sort((a, b) => vidIndex[a].at - vidIndex[b].at);
+  for (const id of oldest) {
+    if (total <= VID_CACHE_CAP * 0.8) break;   // free a chunk, not one file at a time
+    for (const req of keys) if (vidIdOf(req.url) === id) cache.delete(req);
+    total -= vidIndex[id].bytes;
+    delete vidIndex[id];
+  }
+  saveVidIndex();
+}
+
+// hls.js fragment loader with cache-first reads and write-through on miss
+function makeCacheFragLoader() {
+  return class extends Hls.DefaultConfig.loader {
+    load(context, config, callbacks) {
+      if (!CACHE_OK || context.responseType !== 'arraybuffer') {
+        return super.load(context, config, callbacks);
+      }
+      // CMAF fragments are byte ranges within one file — the range MUST be
+      // part of the key or fragments would overwrite each other
+      const range = context.rangeStart != null ? `?r=${context.rangeStart}-${context.rangeEnd ?? ''}` : '';
+      const key = cacheKeyOf(context.url) + range;
+      caches.open(VIDCACHE).then(c => c.match(key)).then(hit => {
+        if (!hit) {
+          const orig = callbacks.onSuccess;
+          callbacks.onSuccess = (response, stats, ctx, xhr) => {
+            if (response.data && response.data.byteLength) {
+              const copy = response.data.slice(0);
+              caches.open(VIDCACHE)
+                .then(c => c.put(key, new Response(copy)))
+                .then(() => bumpVidIndex(vidIdOf(context.url), copy.byteLength))
+                .catch(() => {});
+            }
+            orig(response, stats, ctx, xhr);
+          };
+          return super.load(context, config, callbacks);
+        }
+        hit.arrayBuffer().then(data => {
+          bumpVidIndex(vidIdOf(context.url), 0);   // touch LRU, no size change
+          const now = performance.now();
+          const stats = this.stats;
+          stats.loading.start = stats.loading.first = stats.loading.end = now;
+          stats.loaded = stats.total = data.byteLength;
+          callbacks.onSuccess({ url: context.url, data }, stats, context, null);
+        });
+      }).catch(() => super.load(context, config, callbacks));
+    }
+  };
+}
+
+// mp4 paths: play from cache when we have it (via blob URL), else network
+async function setMp4Src(s, v, url) {
+  s._mp4Url = url;
+  if (CACHE_OK) {
+    try {
+      const cache = await caches.open(VIDCACHE);
+      const hit = await cache.match(cacheKeyOf(url));
+      if (hit) {
+        bumpVidIndex(vidIdOf(url), 0);
+        s._blobUrl = URL.createObjectURL(await hit.blob());
+        v.src = s._blobUrl;
+        return;
+      }
+    } catch {}
+  }
+  v.src = url;
+}
+
+// background write-through queue — one at a time, only videos actually watched
+const mp4CacheQueue = [];
+let mp4Caching = false;
+function queueMp4Cache(url) {
+  if (!CACHE_OK || mp4CacheQueue.includes(url)) return;
+  mp4CacheQueue.push(url);
+  pumpMp4Cache();
+}
+async function pumpMp4Cache() {
+  if (mp4Caching || mp4CacheQueue.length === 0) return;
+  mp4Caching = true;
+  const url = mp4CacheQueue.shift();
+  try {
+    const cache = await caches.open(VIDCACHE);
+    if (!await cache.match(cacheKeyOf(url))) {
+      const res = await fetch(url);
+      const len = +res.headers.get('content-length') || 0;
+      if (res.ok && (!len || len < MP4_CACHE_MAX)) {
+        const buf = await res.arrayBuffer();
+        if (buf.byteLength < MP4_CACHE_MAX) {
+          await cache.put(cacheKeyOf(url), new Response(buf));
+          bumpVidIndex(vidIdOf(url), buf.byteLength);
+        }
+      }
+    }
+  } catch {}
+  mp4Caching = false;
+  setTimeout(pumpMp4Cache, 500);
 }
 
 // Find a playable video for a post, looking beyond native reddit video:
@@ -572,6 +718,16 @@ function openEditor() {
   dbg.onclick = () => { overlay.remove(); soundDebug(); };
   card.appendChild(dbg);
 
+  const cacheBtn = el('button', 'editor-btn',
+    `Clear video cache · ${fmtBytes(cacheTotalBytes())} of ${fmtBytes(VID_CACHE_CAP)}`);
+  cacheBtn.onclick = async () => {
+    if (CACHE_OK) await caches.delete(VIDCACHE);
+    vidIndex = {};
+    saveVidIndex();
+    cacheBtn.textContent = 'Video cache cleared ✓';
+  };
+  card.appendChild(cacheBtn);
+
   const done = el('button', 'editor-btn editor-done', 'Done');
   done.onclick = () => {
     saveSubs();
@@ -741,9 +897,10 @@ function videoSlide(post) {
     s._path = 'redgifs';
     resolveRedgifs(post._redgifs).then(url => {
       if (!url) return;
-      v.src = url;
-      const r = s.getBoundingClientRect();
-      if (r.top < innerHeight * 0.5 && r.bottom > innerHeight * 0.5) v.play().catch(() => {});
+      return setMp4Src(s, v, url).then(() => {
+        const r = s.getBoundingClientRect();
+        if (r.top < innerHeight * 0.5 && r.bottom > innerHeight * 0.5) v.play().catch(() => {});
+      });
     }).catch(() => {});
   } else if (isSafari && rv.hls_url) {
     s._path = 'native-hls';
@@ -755,13 +912,13 @@ function videoSlide(post) {
     s._hlsUrl = rv.hls_url;
   } else if (!/^https:\/\/v\.redd\.it\//.test(rv.fallback_url || '')) {
     s._path = 'mp4-external';
-    v.src = rv.fallback_url;   // e.g. imgur .gifv — no side-audio scheme exists
+    setMp4Src(s, v, rv.fallback_url);   // e.g. imgur .gifv — no side-audio scheme exists
   } else {
     s._path = 'mp4+audio-el';
     // last resort: bare mp4 (video-only) + separate audio element. Reddit's
     // audio filename varies by transcoding era, so walk the candidates until
     // one loads.
-    v.src = rv.fallback_url;
+    setMp4Src(s, v, rv.fallback_url);
     const cut = rv.fallback_url.indexOf('?');
     const query = cut >= 0 ? rv.fallback_url.slice(cut) : '';
     const base = rv.fallback_url.slice(0, rv.fallback_url.lastIndexOf('/'));
@@ -793,6 +950,7 @@ function videoSlide(post) {
   // reddit's audio metadata lies both ways — verify against what's actually
   // being decoded and correct the badge accordingly
   v.addEventListener('playing', () => {
+    s._played = true;   // watched videos become cache candidates on teardown
     clearTimeout(s._audChk);
     s._audChk = setTimeout(() => {
       if (v.paused || s._audio || v.webkitAudioDecodedByteCount === undefined) return;
@@ -946,6 +1104,7 @@ function attachHls(s) {
     backBufferLength: 10,         // small enough to not hog memory/bandwidth
     enableWorker: false,          // extension CSP blocks blob workers; hls.js's
                                   // silent fallback can kill the audio pipeline
+    fLoader: makeCacheFragLoader(),  // disk-cache segments for instant rewatch
   });
   h.on(Hls.Events.ERROR, (_, d) => {
     s._hlsErr = d.type + '/' + d.details + (d.fatal ? ' FATAL' : '');
@@ -1002,16 +1161,31 @@ const warmIO = new IntersectionObserver(entries => {
     if (e.isIntersecting) {
       if (s._hlsUrl) {
         attachHls(s);
-      } else if (v.preload === 'none') {
-        // warm mp4s fetch headers/first bytes only — full download ('auto')
-        // is reserved for the on-screen video so it never fights for bandwidth
-        v.preload = 'metadata';
-        // load() resets the element (and would cancel a play() in flight),
-        // so only kick it for videos that haven't started fetching at all
-        if (v.networkState === HTMLMediaElement.NETWORK_EMPTY) v.load();
+      } else {
+        // slide coming back into range after a cold teardown — re-arm from cache
+        if (s._mp4Url && !v.src) setMp4Src(s, v, s._mp4Url);
+        if (v.preload === 'none') {
+          // warm mp4s fetch headers/first bytes only — full download ('auto')
+          // is reserved for the on-screen video so it never fights for bandwidth
+          v.preload = 'metadata';
+          // load() resets the element (and would cancel a play() in flight),
+          // so only kick it for videos that haven't started fetching at all
+          if (v.networkState === HTMLMediaElement.NETWORK_EMPTY) v.load();
+        }
       }
     } else {
       detachHls(s);
+      // free the blob (whole file in memory) and drop the src; re-armed above
+      // if the slide ever scrolls back into range
+      if (s._blobUrl) {
+        URL.revokeObjectURL(s._blobUrl);
+        s._blobUrl = null;
+        v.removeAttribute('src');
+        v.load();
+      }
+      // a watched mp4/redgifs video becomes a cache candidate now that it's
+      // off-screen and can't compete with the playing video for bandwidth
+      if (s._played && s._mp4Url) queueMp4Cache(s._mp4Url);
     }
   }
 }, { rootMargin: '150% 0px 150% 0px', threshold: 0 });
