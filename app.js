@@ -1,4 +1,4 @@
-const APP_VERSION = '1.16.0';   // shown in the ＋ editor — bump with manifest.json
+const APP_VERSION = '1.17.0';   // shown in the ＋ editor — bump with manifest.json
 
 /* ================= CONFIG ================= */
 // Default subreddits for first launch — after that, edit your list in the app
@@ -105,10 +105,24 @@ const my = {
   slot: 0,                   // position in the video/still rhythm, survives batches
   videoYield: {},            // sub -> videos found so far (guides deep refills)
   sortCursor: (Math.random() * 4) | 0,  // advanced on refresh → different sorts
+  personaIdx: (Math.random() * 5) | 0,  // advanced on refresh → different ranking feel
+  persona: null,
+  spotlight: null,           // subs boosted this refresh so different subs lead
   recycled: false,           // whether shownIds was already recycled this build
 };
 
 const SORTS = [['hot', null], ['top', 'day'], ['rising', null], ['top', 'week']];
+
+// Every refresh rotates to the next persona: a different ranking character
+// (metric weights), different reddit sorts to pull from, and a different
+// video:still rhythm — so refreshes FEEL different, not just reshuffled.
+const PERSONAS = [
+  { name: '🔥 Trending now',     w: { pop: 0.5, buzz: 0.5, vel: 2.2, fresh: 2.4, jit: 0.8 }, vps: 3, sorts: [['hot', null], ['rising', null], ['top', 'day']] },
+  { name: '🏆 All-time bangers', w: { pop: 1.6, buzz: 0.6, vel: 0.3, fresh: 0.3, jit: 0.8 }, vps: 3, sorts: [['top', 'week'], ['top', 'month'], ['top', 'all']] },
+  { name: '🌱 Fresh finds',      w: { pop: 0.3, buzz: 0.3, vel: 1.2, fresh: 3.0, jit: 1.0 }, vps: 2, sorts: [['rising', null], ['new', null], ['hot', null]] },
+  { name: '🎲 Lucky dip',        w: { pop: 0.6, buzz: 0.3, vel: 0.6, fresh: 0.8, jit: 3.0 }, vps: 4, sorts: [['top', 'month'], ['hot', null], ['rising', null], ['top', 'week']] },
+  { name: '⚖️ Classic mix',      w: { pop: 0.8, buzz: 0.4, vel: 1.2, fresh: 2.0, jit: 1.2 }, vps: 3, sorts: SORTS },
+];
 
 /* ---------- tiny DOM helper — all data-driven text via textContent ---------- */
 function el(tag, className, text) {
@@ -444,8 +458,10 @@ function scorePost(p, seed) {
     else lengthFit += 0.3;
   }
   const jitter = seededRand(seed ^ hashStr(p.id));
-  return popularity * 0.8 + buzz * 0.4 + velocity * 1.2 + freshness * 2.0 +
-         lengthFit + jitter * 1.2;
+  const w = (my.persona && my.persona.w) || { pop: 0.8, buzz: 0.4, vel: 1.2, fresh: 2.0, jit: 1.2 };
+  const spotlight = my.spotlight && p.subreddit && my.spotlight.has(p.subreddit.toLowerCase()) ? 0.8 : 0;
+  return popularity * w.pop + buzz * w.buzz + velocity * w.vel + freshness * w.fresh +
+         lengthFit + spotlight + jitter * w.jit;
 }
 
 function pickBatch(buffer, seed, n) {
@@ -462,8 +478,9 @@ function pickBatch(buffer, seed, n) {
     return pool.splice(idx, 1)[0].p;
   };
 
+  const vps = (my.persona && my.persona.vps) || VIDEOS_PER_STILL;
   while (out.length < n && (videos.length || stills.length)) {
-    const wantVideo = my.slot % (VIDEOS_PER_STILL + 1) < VIDEOS_PER_STILL;
+    const wantVideo = my.slot % (vps + 1) < vps;
     const p = wantVideo ? (takeFrom(videos) || takeFrom(stills))
                         : (takeFrom(stills) || takeFrom(videos));
     if (!p) break;
@@ -481,12 +498,20 @@ function pickBatch(buffer, seed, n) {
   return out;
 }
 
-// every refresh advances the cursor, so each sub gets a genuinely different
-// sort than last time (random picks kept colliding → same cached listing)
+// every refresh advances persona + cursor: new ranking character, new sorts
+// per sub, seeded-shuffled sub order, and a fresh spotlight set so different
+// subreddits lead the mix each time
 function rotatedSortPlan() {
-  my.sortCursor = (my.sortCursor + 1) % SORTS.length;
+  my.personaIdx = (my.personaIdx + 1) % PERSONAS.length;
+  my.persona = PERSONAS[my.personaIdx];
+  my.sortCursor = (my.sortCursor + 1) % 9973;
+  const order = [...subs].sort((a, b) =>
+    seededRand(my.seed ^ hashStr(a)) - seededRand(my.seed ^ hashStr(b)));
+  const pool = my.persona.sorts;
   const plan = {};
-  subs.forEach((s, i) => { plan[s] = SORTS[(i + my.sortCursor) % SORTS.length]; });
+  order.forEach((s, i) => { plan[s] = pool[(i + my.sortCursor) % pool.length]; });
+  my.spotlight = new Set(order.slice(0, Math.min(3, Math.ceil(order.length / 3)))
+    .map(s => s.toLowerCase()));
   return plan;
 }
 
@@ -579,7 +604,7 @@ function enterMyFeed(reset) {
   }
   highlightChip('feed:' + activeFeed);
   if (subs.length === 0) return showStatus('This feed is empty — tap ＋ to add subreddits', false);
-  showStatus('Mixing your feed…');
+  showStatus(`Mixing ${my.persona ? my.persona.name : 'your feed'}…`);
   myLoadMore();
 }
 
