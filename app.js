@@ -1,4 +1,4 @@
-const APP_VERSION = '1.14.0';   // shown in the ＋ editor — bump with manifest.json
+const APP_VERSION = '1.15.0';   // shown in the ＋ editor — bump with manifest.json
 
 /* ================= CONFIG ================= */
 // Default subreddits for first launch — after that, edit your list in the app
@@ -39,7 +39,7 @@ const statusText = document.getElementById('status-text');
 // communities (1M+ members each), favoring gif/video subs.
 const PRESET_FEEDS = [
   { name: '😂 Funny', subs: ['funny', 'Unexpected', 'ContagiousLaughter', 'WatchPeopleDieInside', 'therewasanattempt', 'instant_regret', 'AnimalsBeingDerps', 'KidsAreFuckingStupid', 'holdmybeer', 'memes'] },
-  { name: '🖤 Dark Comedy', subs: ['WatchPeopleDieInside', 'PeopleFuckingDying', 'whatcouldgowrong', 'AbruptChaos', 'instantkarma', 'Wellthatsucks', 'LeopardsAteMyFace', 'ImTheMainCharacter', 'dankmemes'] },
+  { name: '🖤 Dark Comedy', subs: ['WatchPeopleDieInside', 'PeopleFuckingDying', 'whatcouldgowrong', 'AbruptChaos', 'instantkarma', 'Wellthatsucks', 'LeopardsAteMyFace', 'ImTheMainCharacter', 'dankmemes', 'HolUp', 'shitposting', 'distressingmemes', 'NoahGetTheBoat', 'MakeMeSuffer', 'blursedimages'] },
   { name: '🔬 Science', subs: ['Damnthatsinteresting', 'interestingasfuck', 'educationalgifs', 'chemicalreactiongifs', 'science', 'blackmagicfuckery'] },
   { name: '🌌 Space', subs: ['space', 'spaceporn', 'astrophotography', 'nasa', 'Astronomy', 'spacex'] },
   { name: '🐾 Animals', subs: ['aww', 'AnimalsBeingBros', 'AnimalsBeingDerps', 'AnimalsBeingJerks', 'rarepuppers', 'Zoomies', 'cats', 'dogswithjobs', 'NatureIsFuckingLit'] },
@@ -737,6 +737,10 @@ function openEditor() {
       if (idx === -1) {
         feeds.push({ name: preset.name, subs: preset.subs.slice() });
         idx = feeds.length - 1;
+      } else {
+        // preset lists evolve — re-tapping merges new subs into your copy
+        const have = new Set(feeds[idx].subs.map(s => s.toLowerCase()));
+        for (const s of preset.subs) if (!have.has(s.toLowerCase())) feeds[idx].subs.push(s);
       }
       if (preset.nsfw && !showNsfw) {
         showNsfw = true;
