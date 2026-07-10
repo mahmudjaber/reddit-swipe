@@ -1,4 +1,4 @@
-const APP_VERSION = '1.13.0';   // shown in the ＋ editor — bump with manifest.json
+const APP_VERSION = '1.14.0';   // shown in the ＋ editor — bump with manifest.json
 
 /* ================= CONFIG ================= */
 // Default subreddits for first launch — after that, edit your list in the app
@@ -33,11 +33,51 @@ const topbar = document.getElementById('topbar');
 const statusEl = document.getElementById('status');
 const statusText = document.getElementById('status-text');
 
+/* ---------- smart feed presets ---------- */
+// Curated, video/image-heavy combos — tap one in the ＋ panel to add it as a
+// feed. The NSFW list is imported from nsfwdog.com's most-subscribed
+// communities (1M+ members each), favoring gif/video subs.
+const PRESET_FEEDS = [
+  { name: '😂 Funny', subs: ['funny', 'Unexpected', 'ContagiousLaughter', 'WatchPeopleDieInside', 'therewasanattempt', 'instant_regret', 'AnimalsBeingDerps', 'KidsAreFuckingStupid', 'holdmybeer', 'memes'] },
+  { name: '🖤 Dark Comedy', subs: ['WatchPeopleDieInside', 'PeopleFuckingDying', 'whatcouldgowrong', 'AbruptChaos', 'instantkarma', 'Wellthatsucks', 'LeopardsAteMyFace', 'ImTheMainCharacter', 'dankmemes'] },
+  { name: '🔬 Science', subs: ['Damnthatsinteresting', 'interestingasfuck', 'educationalgifs', 'chemicalreactiongifs', 'science', 'blackmagicfuckery'] },
+  { name: '🌌 Space', subs: ['space', 'spaceporn', 'astrophotography', 'nasa', 'Astronomy', 'spacex'] },
+  { name: '🐾 Animals', subs: ['aww', 'AnimalsBeingBros', 'AnimalsBeingDerps', 'AnimalsBeingJerks', 'rarepuppers', 'Zoomies', 'cats', 'dogswithjobs', 'NatureIsFuckingLit'] },
+  { name: '🤯 Mind-blowing', subs: ['nextfuckinglevel', 'BeAmazed', 'toptalent', 'blackmagicfuckery', 'woahdude', 'Damnthatsinteresting', 'humansaremetal'] },
+  { name: '✨ Satisfying', subs: ['oddlysatisfying', 'powerwashingporn', 'ASMR', 'ArtisanVideos', 'toptalent'] },
+  { name: '🍔 Food', subs: ['FoodPorn', 'GifRecipes', 'food', 'Baking', 'Pizza'] },
+  { name: '🎮 Gaming', subs: ['gaming', 'GamePhysics', 'pcmasterrace', 'IndieGaming'] },
+  { name: '⚽ Sports', subs: ['sports', 'nba', 'soccer', 'formula1', 'MMA', 'TheOcho'] },
+  { name: '🛠 Engineering', subs: ['EngineeringPorn', 'specializedtools', 'mechanical_gifs', 'techsupportgore', 'gadgets'] },
+  { name: '🌍 Nature & Travel', subs: ['EarthPorn', 'NatureIsFuckingLit', 'natureismetal', 'travel', 'hiking', 'CampingandHiking'] },
+  { name: '🔞 NSFW', nsfw: true, subs: ['RealGirls', 'nsfw_gif', 'GirlsFinishingTheJob', 'TittyDrop', 'HoldTheMoan', 'porninfifteenseconds', 'LegalTeens', 'PetiteGoneWild', 'AsiansGoneWild', 'collegesluts', 'gonewild', 'BustyPetite', 'pawg', 'LipsThatGrip', 'adorableporn', 'nsfwhardcore', 'Blowjobs', 'milf', 'BiggerThanYouThought', 'SheFucksHim'] },
+];
+
 /* ---------- persistent state ---------- */
-let subs;
-try { subs = JSON.parse(localStorage.getItem('rs.subs')); } catch {}
-if (!Array.isArray(subs) || subs.length === 0) subs = DEFAULT_SUBREDDITS.slice();
-function saveSubs() { localStorage.setItem('rs.subs', JSON.stringify(subs)); }
+// feeds: [{ name, subs: [...] }], one of them active. Migrates the legacy
+// single rs.subs list into feeds[0].
+let feeds;
+try { feeds = JSON.parse(localStorage.getItem('rs.feeds')); } catch {}
+if (!Array.isArray(feeds) || feeds.length === 0 || !feeds.every(f => f && f.name && Array.isArray(f.subs))) {
+  let legacy;
+  try { legacy = JSON.parse(localStorage.getItem('rs.subs')); } catch {}
+  feeds = [{ name: '⭐ My Feed', subs: Array.isArray(legacy) && legacy.length ? legacy : DEFAULT_SUBREDDITS.slice() }];
+}
+let activeFeed = parseInt(localStorage.getItem('rs.activeFeed'), 10) || 0;
+if (activeFeed < 0 || activeFeed >= feeds.length) activeFeed = 0;
+let subs = feeds[activeFeed].subs;   // alias the engine reads everywhere
+function saveSubs() {
+  feeds[activeFeed].subs = subs;
+  localStorage.setItem('rs.feeds', JSON.stringify(feeds));
+  localStorage.setItem('rs.activeFeed', String(activeFeed));
+}
+function switchFeed(i) {
+  activeFeed = Math.max(0, Math.min(i, feeds.length - 1));
+  subs = feeds[activeFeed].subs;
+  saveSubs();
+  rebuildTopbar();
+  enterMyFeed(true);
+}
 
 let showNsfw = localStorage.getItem('rs.nsfw') === '1';
 
@@ -474,6 +514,13 @@ async function ensureBuffer() {
         my.videoYield[sub] = (my.videoYield[sub] || 0) + posts.filter(p => p._rv).length;
         my.buffer.push(...posts);
       }));
+      // banned/private/typo'd subs (common in imported lists) 404 forever —
+      // mark them exhausted so they can't stall or re-fetch every round
+      results.forEach((r, i) => {
+        if (r.status === 'rejected' && /HTTP (403|404|451)/.test(String(r.reason && r.reason.message))) {
+          my.afters[pending[i]] = null;
+        }
+      });
       const failures = results.filter(r => r.status === 'rejected');
       if (failures.length === pending.length) throw failures[0].reason;
     }
@@ -529,7 +576,8 @@ function enterMyFeed(reset) {
     feed.replaceChildren();
     feed.scrollTop = 0;
   }
-  highlightChip('my');
+  highlightChip('feed:' + activeFeed);
+  if (subs.length === 0) return showStatus('This feed is empty — tap ＋ to add subreddits', false);
   showStatus('Mixing your feed…');
   myLoadMore();
 }
@@ -597,24 +645,19 @@ function loadMore() { mode === 'my' ? myLoadMore() : subLoadMore(); }
    ======================================================================= */
 function rebuildTopbar() {
   topbar.replaceChildren();
-  const myChip = el('button', 'chip', '⭐ My Feed');
-  myChip.dataset.key = 'my';
-  myChip.onclick = () => { if (mode !== 'my') enterMyFeed(true); };
-  topbar.appendChild(myChip);
-
-  for (const sub of subs) {
-    const b = el('button', 'chip', 'r/' + sub);
-    b.dataset.key = sub;
-    b.onclick = () => { if (!(mode === 'sub' && currentSub === sub)) enterSub(sub, true); };
+  feeds.forEach((f, i) => {
+    const b = el('button', 'chip', f.name);
+    b.dataset.key = 'feed:' + i;
+    b.onclick = () => { if (i !== activeFeed || mode !== 'my') switchFeed(i); };
     topbar.appendChild(b);
-  }
+  });
 
   const edit = el('button', 'chip', '＋');
-  edit.title = 'Edit subreddits';
+  edit.title = 'Manage feeds';
   edit.onclick = openEditor;
   topbar.appendChild(edit);
 
-  highlightChip(mode === 'my' ? 'my' : currentSub);
+  highlightChip(mode === 'my' ? 'feed:' + activeFeed : currentSub);
 }
 function highlightChip(key) {
   document.querySelectorAll('.chip').forEach(c =>
@@ -624,8 +667,90 @@ function highlightChip(key) {
 function openEditor() {
   const overlay = el('div', 'editor-overlay');
   const card = el('div', 'editor-card');
-  card.appendChild(el('div', 'editor-title', `My Feed subreddits — v${APP_VERSION}`));
+  card.appendChild(el('div', 'editor-title', `Feeds — v${APP_VERSION}`));
 
+  /* ----- your feeds: switch, create, delete ----- */
+  const feedList = el('div', 'editor-list');
+  const subsTitle = el('div', 'editor-sect');
+  const renderFeeds = () => {
+    feedList.replaceChildren();
+    feeds.forEach((f, i) => {
+      const row = el('div', 'editor-row' + (i === activeFeed ? ' active-feed' : ''));
+      const name = el('span', null, (i === activeFeed ? '▶ ' : '') + f.name);
+      name.style.cursor = 'pointer';
+      name.onclick = () => {
+        saveSubs();                        // persist edits to the feed we're leaving
+        activeFeed = i;
+        subs = feeds[i].subs;
+        saveSubs();
+        renderFeeds();
+        renderList();
+      };
+      row.appendChild(name);
+      const rm = el('button', 'editor-remove', '✕');
+      rm.onclick = () => {
+        if (feeds.length === 1) return alert('Keep at least one feed');
+        feeds.splice(i, 1);
+        if (activeFeed >= feeds.length) activeFeed = feeds.length - 1;
+        subs = feeds[activeFeed].subs;
+        saveSubs();
+        renderFeeds();
+        renderList();
+      };
+      row.appendChild(rm);
+      feedList.appendChild(row);
+    });
+    subsTitle.textContent = 'Subreddits in ' + feeds[activeFeed].name;
+  };
+  card.appendChild(feedList);
+
+  const newFeedRow = el('div', 'editor-add');
+  const feedInput = document.createElement('input');
+  feedInput.placeholder = 'new feed name, e.g. Chill';
+  const newFeedBtn = el('button', 'editor-btn', 'Create');
+  const createFeed = () => {
+    const name = feedInput.value.trim().slice(0, 24);
+    if (!name) return;
+    saveSubs();
+    feeds.push({ name, subs: [] });
+    activeFeed = feeds.length - 1;
+    subs = feeds[activeFeed].subs;
+    saveSubs();
+    feedInput.value = '';
+    renderFeeds();
+    renderList();
+  };
+  newFeedBtn.onclick = createFeed;
+  feedInput.addEventListener('keydown', e => { if (e.key === 'Enter') createFeed(); });
+  newFeedRow.appendChild(feedInput);
+  newFeedRow.appendChild(newFeedBtn);
+  card.appendChild(newFeedRow);
+
+  /* ----- smart feeds: one tap adds the combo and starts watching ----- */
+  card.appendChild(el('div', 'editor-sect', 'Smart feeds — tap to add & watch'));
+  const grid = el('div', 'preset-grid');
+  for (const preset of PRESET_FEEDS) {
+    const b = el('button', 'editor-btn', preset.name);
+    b.onclick = () => {
+      saveSubs();
+      let idx = feeds.findIndex(f => f.name === preset.name);
+      if (idx === -1) {
+        feeds.push({ name: preset.name, subs: preset.subs.slice() });
+        idx = feeds.length - 1;
+      }
+      if (preset.nsfw && !showNsfw) {
+        showNsfw = true;
+        localStorage.setItem('rs.nsfw', '1');
+      }
+      overlay.remove();
+      switchFeed(idx);
+    };
+    grid.appendChild(b);
+  }
+  card.appendChild(grid);
+
+  /* ----- subreddits of the selected feed ----- */
+  card.appendChild(subsTitle);
   const list = el('div', 'editor-list');
   const renderList = () => {
     list.replaceChildren();
@@ -634,7 +759,6 @@ function openEditor() {
       row.appendChild(el('span', null, 'r/' + sub));
       const rm = el('button', 'editor-remove', '✕');
       rm.onclick = () => {
-        if (subs.length === 1) return alert('Keep at least one subreddit');
         subs = subs.filter(s => s !== sub);
         renderList();
       };
@@ -642,6 +766,7 @@ function openEditor() {
       list.appendChild(row);
     }
   };
+  renderFeeds();
   renderList();
   card.appendChild(list);
 
@@ -680,7 +805,8 @@ function openEditor() {
   const xferRow = el('div', 'editor-add');
   const copyBtn = el('button', 'editor-btn', 'Copy my settings');
   copyBtn.onclick = async () => {
-    const payload = JSON.stringify({ subs, nsfw: showNsfw });
+    saveSubs();
+    const payload = JSON.stringify({ feeds, activeFeed, nsfw: showNsfw });
     try { await navigator.clipboard.writeText(payload); copyBtn.textContent = 'Copied ✓'; }
     catch { prompt('Copy this:', payload); }
     setTimeout(() => (copyBtn.textContent = 'Copy my settings'), 1500);
@@ -689,14 +815,21 @@ function openEditor() {
   pasteBtn.onclick = () => {
     const raw = prompt('Paste your settings (from "Copy my settings" on the other device):');
     if (!raw) return;
+    const validSubs = a => Array.isArray(a) && a.every(s => /^[A-Za-z0-9_]{2,21}$/.test(s));
     try {
       const j = JSON.parse(raw);
-      if (!Array.isArray(j.subs) || !j.subs.every(s => /^[A-Za-z0-9_]{2,21}$/.test(s))) throw 0;
-      subs = j.subs;
+      if (Array.isArray(j.feeds) && j.feeds.every(f => f && f.name && validSubs(f.subs))) {
+        feeds = j.feeds;
+        activeFeed = Math.min(Math.max(0, j.activeFeed | 0), feeds.length - 1);
+      } else if (validSubs(j.subs) && j.subs.length) {   // legacy single-list payload
+        feeds[activeFeed].subs = j.subs;
+      } else throw 0;
+      subs = feeds[activeFeed].subs;
       showNsfw = !!j.nsfw;
       localStorage.setItem('rs.nsfw', showNsfw ? '1' : '0');
       nsfwToggle.checked = showNsfw;
       saveSubs();
+      renderFeeds();
       renderList();
     } catch {
       // also accept a plain comma/space separated list of subreddit names
@@ -733,15 +866,13 @@ function openEditor() {
     saveSubs();
     overlay.remove();
     rebuildTopbar();
-    if (mode === 'sub' && !subs.includes(currentSub)) enterMyFeed(true);
-    else if (mode === 'my') enterMyFeed(true);
+    enterMyFeed(true);
   };
   card.appendChild(done);
 
   overlay.appendChild(card);
   overlay.addEventListener('click', e => { if (e.target === overlay) done.onclick(); });
   document.body.appendChild(overlay);
-  input.focus();
 }
 
 /* =======================================================================
