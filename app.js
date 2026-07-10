@@ -1,4 +1,4 @@
-const APP_VERSION = '1.18.0';   // shown in the ＋ editor — bump with manifest.json
+const APP_VERSION = '1.19.0';   // shown in the ＋ editor — bump with manifest.json
 
 /* ================= CONFIG ================= */
 // Default subreddits for first launch — after that, edit your list in the app
@@ -51,7 +51,7 @@ const PRESET_FEEDS = [
   { name: '⚽ Sports', subs: ['sports', 'nba', 'soccer', 'formula1', 'MMA', 'TheOcho'] },
   { name: '🛠 Engineering', subs: ['EngineeringPorn', 'specializedtools', 'mechanical_gifs', 'techsupportgore', 'gadgets'] },
   { name: '🌍 Nature & Travel', subs: ['EarthPorn', 'NatureIsFuckingLit', 'natureismetal', 'travel', 'hiking', 'CampingandHiking'] },
-  { name: '🔞 NSFW', nsfw: true, subs: ['RealGirls', 'nsfw_gif', 'GirlsFinishingTheJob', 'TittyDrop', 'HoldTheMoan', 'porninfifteenseconds', 'LegalTeens', 'PetiteGoneWild', 'AsiansGoneWild', 'collegesluts', 'gonewild', 'BustyPetite', 'pawg', 'LipsThatGrip', 'adorableporn', 'nsfwhardcore', 'Blowjobs', 'milf', 'BiggerThanYouThought', 'SheFucksHim'] },
+  { name: '🔞 NSFW', nsfw: true, subs: ['RealGirls', 'nsfw_gif', 'GirlsFinishingTheJob', 'TittyDrop', 'HoldTheMoan', 'porninfifteenseconds', 'LegalTeens', 'PetiteGoneWild', 'AsiansGoneWild', 'collegesluts', 'gonewild', 'BustyPetite', 'pawg', 'LipsThatGrip', 'adorableporn', 'nsfwhardcore', 'Blowjobs', 'milf', 'BiggerThanYouThought', 'SheFucksHim', '60fpsporn', 'porn_gifs', 'NSFWverifiedamateurs', 'homemadexxx'] },
 ];
 
 /* ---------- persistent state ---------- */
@@ -81,6 +81,50 @@ function switchFeed(i) {
 }
 
 let showNsfw = localStorage.getItem('rs.nsfw') === '1';
+
+/* ---------- saved posts (surface in 👤 Profile) ---------- */
+let savedPosts = [];
+try { savedPosts = JSON.parse(localStorage.getItem('rs.saved')) || []; } catch {}
+const SAVED_MAX = 300;   // localStorage budget — oldest save drops past this
+function persistSaved() {
+  try { localStorage.setItem('rs.saved', JSON.stringify(savedPosts)); }
+  catch { alert('Saved list is full — remove some saved posts in 👤'); }
+}
+function isSaved(id) { return savedPosts.some(p => p.id === id); }
+// keep only the fields the slide builders actually read — full reddit post
+// objects are 10-30KB each and would blow the localStorage quota fast
+function slimPost(post) {
+  const p = {};
+  for (const k of ['id', 'title', 'subreddit', 'author', 'ups', 'num_comments', 'permalink',
+                   'created_utc', 'over_18', 'is_video', 'url', 'is_gallery',
+                   'gallery_data', 'media_metadata', 'domain']) {
+    if (post[k] !== undefined) p[k] = post[k];
+  }
+  if (post.media && post.media.reddit_video) p.media = { reddit_video: post.media.reddit_video };
+  const xp = post.crosspost_parent_list && post.crosspost_parent_list[0];
+  if (xp && xp.media) p.crosspost_parent_list = [{ media: xp.media }];
+  if (post.preview) {
+    p.preview = {};
+    if (post.preview.reddit_video_preview) p.preview.reddit_video_preview = post.preview.reddit_video_preview;
+    const img = post.preview.images && post.preview.images[0];
+    if (img) p.preview.images = [{ source: img.source, resolutions: (img.resolutions || []).slice(0, 4) }];
+  }
+  return p;
+}
+function toggleSave(post, btn) {
+  const i = savedPosts.findIndex(p => p.id === post.id);
+  if (i >= 0) savedPosts.splice(i, 1);
+  else {
+    savedPosts.unshift(slimPost(post));
+    if (savedPosts.length > SAVED_MAX) savedPosts.pop();
+  }
+  persistSaved();
+  if (btn) {
+    const on = isSaved(post.id);
+    btn.querySelector('.icon').textContent = on ? '💛' : '🔖';
+    btn.lastChild.textContent = on ? 'saved' : 'save';
+  }
+}
 
 /* ---------- session state ---------- */
 let mode = 'my';             // 'my' = mixed algorithmic feed, 'sub' = single subreddit
@@ -658,7 +702,9 @@ function enterSub(sub, resetSort) {
 
 /* ---------- refresh: new content, new order ---------- */
 function refresh() {
-  if (mode === 'my') {
+  if (mode === 'saved') {
+    enterSavedFeed();
+  } else if (mode === 'my') {
     enterMyFeed(true);
   } else {
     subSortIdx = (subSortIdx + 1) % SORTS.length;   // hot → top(day) → rising → top(week)
@@ -666,13 +712,27 @@ function refresh() {
   }
 }
 
-function loadMore() { mode === 'my' ? myLoadMore() : subLoadMore(); }
+function loadMore() {
+  if (mode === 'saved') return;   // saved feed is finite, no pagination
+  mode === 'my' ? myLoadMore() : subLoadMore();
+}
 
 /* =======================================================================
    TOP BAR + SUBREDDIT EDITOR
    ======================================================================= */
 function rebuildTopbar() {
   topbar.replaceChildren();
+
+  const home = el('button', 'chip', '🏠');
+  home.dataset.key = 'home';
+  home.title = 'Back to your feed';
+  home.onclick = () => {
+    document.querySelector('.editor-overlay')?.remove();
+    if (mode !== 'my') switchFeed(activeFeed);
+    else feed.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+  topbar.appendChild(home);
+
   feeds.forEach((f, i) => {
     const b = el('button', 'chip', f.name);
     b.dataset.key = 'feed:' + i;
@@ -680,12 +740,18 @@ function rebuildTopbar() {
     topbar.appendChild(b);
   });
 
+  const prof = el('button', 'chip', '👤');
+  prof.dataset.key = 'profile';
+  prof.title = 'Profile — saved posts';
+  prof.onclick = openProfile;
+  topbar.appendChild(prof);
+
   const edit = el('button', 'chip', '＋');
   edit.title = 'Manage feeds';
   edit.onclick = openEditor;
   topbar.appendChild(edit);
 
-  highlightChip(mode === 'my' ? 'feed:' + activeFeed : currentSub);
+  highlightChip(mode === 'my' ? 'feed:' + activeFeed : mode === 'saved' ? 'profile' : currentSub);
 }
 function highlightChip(key) {
   document.querySelectorAll('.chip').forEach(c =>
@@ -908,6 +974,124 @@ function openEditor() {
 }
 
 /* =======================================================================
+   DOWNLOADS + PROFILE + SAVED FEED
+   ======================================================================= */
+// best single-file representation of a post, favoring files with audio
+function downloadTargetOf(post, s) {
+  if (s && s._mp4Url) return { url: s._mp4Url, ext: '.mp4' };          // redgifs/external — audio included
+  const rv = post._rv || videoInfoOf(post);
+  if (rv && rv.fallback_url) return { url: rv.fallback_url, ext: '.mp4' };
+  const src = post.preview && post.preview.images && post.preview.images[0] && post.preview.images[0].source;
+  if (src && src.url) return { url: src.url, ext: '.jpg' };
+  if (post.media_metadata) {                                            // gallery: first image
+    const first = Object.values(post.media_metadata)[0];
+    const u = first && first.s && (first.s.u || first.s.gif);
+    if (u) return { url: u, ext: first.s && first.s.gif ? '.gif' : '.jpg' };
+  }
+  if (isDirectImage(post)) return { url: post.url, ext: '.jpg' };
+  return null;
+}
+async function downloadPost(post, s, btn) {
+  const t = downloadTargetOf(post, s);
+  if (!t) return alert('Nothing downloadable on this post');
+  const icon = btn && btn.querySelector('.icon');
+  if (icon) icon.textContent = '⏳';
+  try {
+    const res = await fetch(t.url);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const blob = await res.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = (post.subreddit || 'reddit') + '-' + post.id + t.ext;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 30_000);
+    if (icon) icon.textContent = '✅';
+  } catch (e) {
+    if (icon) icon.textContent = '⚠️';
+    alert('Download failed: ' + e.message);
+  }
+  setTimeout(() => { if (icon) icon.textContent = '⬇'; }, 2000);
+}
+
+function enterSavedFeed(startId) {
+  mode = 'saved';
+  currentSub = null;
+  feed.replaceChildren();
+  feed.scrollTop = 0;
+  highlightChip('profile');
+  let target = null;
+  for (const p of savedPosts) {
+    const rv = videoInfoOf(p);
+    if (rv) p._rv = rv;
+    const rg = (p.url || '').match(/redgifs\.com\/(?:watch|ifr)\/([a-z0-9]+)/i);
+    if (rg) p._redgifs = rg[1].toLowerCase();
+    const slide = buildSlide(p);
+    if (slide) {
+      feed.appendChild(slide);
+      if (p.id === startId) target = slide;
+    }
+  }
+  if (feed.children.length === 0) return showStatus('Nothing saved yet — tap 🔖 on any post', false);
+  hideStatus();
+  if (target) target.scrollIntoView();
+}
+
+function openProfile() {
+  const overlay = el('div', 'editor-overlay');
+  const card = el('div', 'editor-card');
+  card.appendChild(el('div', 'editor-title', '👤 Profile'));
+
+  card.appendChild(el('div', 'editor-sect', `Saved posts (${savedPosts.length})`));
+  if (savedPosts.length) {
+    const watch = el('button', 'editor-btn editor-done', '▶ Watch saved feed');
+    watch.onclick = () => { overlay.remove(); enterSavedFeed(); };
+    card.appendChild(watch);
+  }
+  const grid = el('div', 'saved-grid');
+  const render = () => {
+    grid.replaceChildren();
+    if (!savedPosts.length) grid.appendChild(el('div', null, 'Nothing saved yet — tap 🔖 on any post'));
+    for (const p of savedPosts) {
+      const c = el('div', 'saved-card');
+      const img = document.createElement('img');
+      img.loading = 'lazy';
+      img.src = posterOf(p) || '';
+      c.appendChild(img);
+      const info = el('div', 'saved-info');
+      info.appendChild(el('div', 'saved-title', p.title));
+      info.appendChild(el('div', 'saved-sub', 'r/' + p.subreddit));
+      c.appendChild(info);
+      const rm = el('button', 'editor-remove', '✕');
+      rm.onclick = e => {
+        e.stopPropagation();
+        savedPosts = savedPosts.filter(x => x.id !== p.id);
+        persistSaved();
+        render();
+      };
+      c.appendChild(rm);
+      c.onclick = () => { overlay.remove(); enterSavedFeed(p.id); };
+      grid.appendChild(c);
+    }
+  };
+  render();
+  card.appendChild(grid);
+
+  card.appendChild(el('div', 'editor-sect', 'Stats'));
+  card.appendChild(el('div', null,
+    `${feeds.length} feed${feeds.length === 1 ? '' : 's'} · video cache ${fmtBytes(cacheTotalBytes())} · v${APP_VERSION}`));
+
+  const done = el('button', 'editor-btn editor-done', 'Close');
+  done.onclick = () => overlay.remove();
+  card.appendChild(done);
+
+  overlay.appendChild(card);
+  overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+  document.body.appendChild(overlay);
+}
+
+/* =======================================================================
    SOUND SELF-TEST — ＋ editor → "Sound debug"
    ======================================================================= */
 async function soundDebug() {
@@ -1009,6 +1193,16 @@ function baseSlide(post, typeLabel) {
     if (navigator.share) { try { await navigator.share({ title: post.title, url: permalink }); } catch {} }
     else { await navigator.clipboard.writeText(permalink); alert('Link copied'); }
   }));
+  const saveBtn = railButton(isSaved(post.id) ? '💛' : '🔖', isSaved(post.id) ? 'saved' : 'save', e => {
+    e.stopPropagation();
+    toggleSave(post, saveBtn);
+  });
+  rail.appendChild(saveBtn);
+  const dlBtn = railButton('⬇', 'download', e => {
+    e.stopPropagation();
+    downloadPost(post, s, dlBtn);
+  });
+  rail.appendChild(dlBtn);
   s.appendChild(rail);
 
   if (typeLabel) s.appendChild(el('div', 'type-badge', typeLabel));
