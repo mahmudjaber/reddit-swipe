@@ -1,4 +1,4 @@
-const APP_VERSION = '1.19.0';   // shown in the ＋ editor — bump with manifest.json
+const APP_VERSION = '1.20.0';   // shown in the ＋ editor — bump with manifest.json
 
 /* ================= CONFIG ================= */
 // Default subreddits for first launch — after that, edit your list in the app
@@ -52,6 +52,8 @@ const PRESET_FEEDS = [
   { name: '🛠 Engineering', subs: ['EngineeringPorn', 'specializedtools', 'mechanical_gifs', 'techsupportgore', 'gadgets'] },
   { name: '🌍 Nature & Travel', subs: ['EarthPorn', 'NatureIsFuckingLit', 'natureismetal', 'travel', 'hiking', 'CampingandHiking'] },
   { name: '🔞 NSFW', nsfw: true, subs: ['RealGirls', 'nsfw_gif', 'GirlsFinishingTheJob', 'TittyDrop', 'HoldTheMoan', 'porninfifteenseconds', 'LegalTeens', 'PetiteGoneWild', 'AsiansGoneWild', 'collegesluts', 'gonewild', 'BustyPetite', 'pawg', 'LipsThatGrip', 'adorableporn', 'nsfwhardcore', 'Blowjobs', 'milf', 'BiggerThanYouThought', 'SheFucksHim', '60fpsporn', 'porn_gifs', 'NSFWverifiedamateurs', 'homemadexxx'] },
+  // second set — the rest of nsfwdog.com's 1M+ communities, no overlap with NSFW 1
+  { name: '🔞 NSFW 2', nsfw: true, subs: ['nsfw', 'porn', 'cumsluts', 'anal', 'lesbians', 'BreedingMaterial', 'latinas', 'AsianHotties', 'boobs', 'ass', 'bigasses', 'pussy', 'curvy', 'GothSluts', 'DadWouldBeProud', 'needysluts', 'godpussy', 'nsfw_gifs', 'tiktokporn', 'TikTokNSFW', 'nudes', 'slut', 'Amateur', 'NSFW_Snapchat'] },
 ];
 
 /* ---------- persistent state ---------- */
