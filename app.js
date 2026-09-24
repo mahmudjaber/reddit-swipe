@@ -1,4 +1,4 @@
-const APP_VERSION = '1.21.0';   // shown in the ＋ editor — bump with manifest.json
+const APP_VERSION = '1.22.0';   // shown in the ＋ editor — bump with manifest.json
 
 /* ================= CONFIG ================= */
 // Default subreddits for first launch — after that, edit your list in the app
@@ -57,6 +57,10 @@ const PRESET_FEEDS = [
   // sets 3 and 4 come from nsfwdog.com directory pages 2 and 3 (all 1M+)
   { name: '🔞 NSFW 3', nsfw: true, subs: ['squirting', 'juicyasians', 'chubby', 'JizzedToThis', 'ThickThighs', 'OnOff', 'shelikesitrough', 'girlsmasturbating', 'deepthroat', 'cuckold', 'hotwife', 'RealHomePorn', 'BigBoobsGW', 'tiktokthots', 'naturaltitties', 'bigtiddygothgf', 'thickwhitegirls', 'asstastic', 'creampies', 'homemadensfw', 'stacked', 'SlutsOfSnapchat', 'FitNakedGirls', 'WatchItForThePlot', 'nsfwcosplay', 'threesome', 'PublicFlashing', 'GettingHerselfOff', 'paag'] },
   { name: '🔞 NSFW 4', nsfw: true, subs: ['shortporn', 'amateurcumsluts', 'egirls', 'naughtywives', 'altgonewild', 'AnalGW', 'PublicSexPorn', 'palegirls', 'booty', 'smallboobs', 'cumshots', 'gonewild30plus', 'redheads', 'hotmoms', 'girlswhoride', 'BootyQueens', 'WomenBendingOver', 'facefuck', 'boobbounce', 'brownhotties', 'BDSM', 'OBSF', 'tinytits', 'doggystyle_nsfw', 'ebony', 'orgasms', 'girlsinyogapants', 'justfriendshavingfun', 'slimthick', 'adorablenudes', 'AmateurPorn', 'collegeamateurs'] },
+  // sets 5-7 come from nsfwdog.com directory pages 4-6 (all 1M+)
+  { name: '🔞 NSFW 5', nsfw: true, subs: ['AsianNSFW', 'SpreadEm', 'couplesgonewild', 'maturemilf', 'fitgirls', 'tits', 'petite', 'PerfectBody', 'wetpussys', 'massivecock', 'rearpussy', 'gwpublic', 'bubblebutts', 'hugeboobs', 'BodyPerfection', 'IndiansGoneWild', 'wifesharing', 'ebonyhomemade', 'massivetitsnass', 'MasturbationGoneWild', 'PornStarHQ', 'twerking', 'nipples', 'BDSMGW', 'girlswithglasses', 'LongPorn', 'amateurmilfs', 'SwingersGW', 'CougarsForCubs', 'slutwife', 'gwcouples', 'boobies'] },
+  { name: '🔞 NSFW 6', nsfw: true, subs: ['OutdoorRecreation', 'TightDresses', 'hotchickswithtattoos', 'sextrophies', 'FlashingGirls', 'buttplug', 'BBW', 'hungrybutts', 'damngoodinterracial', 'quiver', 'normalnudes', 'PublicNudity', 'BonerMaterial', 'shavedpussies', 'pronebone', 'cosplaybabes', '2busty2hide', 'mombod', 'couplesporn', 'ghostnipples', 'facedownassup', 'creampie', 'ediblebuttholes', 'BustyNaturals', 'funsized', 'punkgirls', 'vagina', 'stripgirls', 'monsterdicks', 'assholebehindthong'] },
+  { name: '🔞 NSFW 7', nsfw: true, subs: ['lesbian_gifs', 'exhibitionistfun', 'bimbofetish', 'gangbang', 'UnderwearGW', 'KoreanNSFW', 'emogirlsfuck', 'boltedontits', 'homegrowntits', 'bustyasians', 'girlsshowering', 'LabiaGW', 'bigtitsinbikinis', 'centaurgirls', 'thighhighs', 'NSFW_Japan', 'hairypussy', 'indianbabes', 'RealPublicNudity', 'athleticbabes', 'pantiestotheside', 'AsianPorn', 'girlskissing', 'FlashingAndFlaunting', 'darkangels', 'cuckquean', 'StraightGirlsPlaying', '40plusGoneWild', 'extramile', 'braless', 'bigareolas', 'camgirls', 'ridingxxx'] },
 ];
 
 /* ---------- persistent state ---------- */
