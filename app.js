@@ -77,13 +77,16 @@ if (!Array.isArray(feeds) || feeds.length === 0 || !feeds.every(f => f && f.name
   try { legacy = JSON.parse(localStorage.getItem('rs.subs')); } catch {}
   feeds = [{ name: '⭐ My Feed', subs: Array.isArray(legacy) && legacy.length ? legacy : DEFAULT_SUBREDDITS.slice() }];
 }
-let activeFeed = parseInt(localStorage.getItem('rs.activeFeed'), 10) || 0;
+let activeFeed = 0;
+try { activeFeed = parseInt(localStorage.getItem('rs.activeFeed'), 10) || 0; } catch {}
 if (activeFeed < 0 || activeFeed >= feeds.length) activeFeed = 0;
 let subs = feeds[activeFeed].subs;   // alias the engine reads everywhere
 function saveSubs() {
   feeds[activeFeed].subs = subs;
-  localStorage.setItem('rs.feeds', JSON.stringify(feeds));
-  localStorage.setItem('rs.activeFeed', String(activeFeed));
+  try {
+    localStorage.setItem('rs.feeds', JSON.stringify(feeds));
+    localStorage.setItem('rs.activeFeed', String(activeFeed));
+  } catch (e) { console.warn('saveSubs failed', e); }
 }
 function switchFeed(i) {
   activeFeed = Math.max(0, Math.min(i, feeds.length - 1));
@@ -93,15 +96,25 @@ function switchFeed(i) {
   enterMyFeed(true);
 }
 
-let showNsfw = localStorage.getItem('rs.nsfw') === '1';
+let showNsfw = false;
+try { showNsfw = localStorage.getItem('rs.nsfw') === '1'; } catch {}
+function persistNsfw() { try { localStorage.setItem('rs.nsfw', showNsfw ? '1' : '0'); } catch {} }
 
 /* ---------- saved posts (surface in 👤 Profile) ---------- */
 let savedPosts = [];
-try { savedPosts = JSON.parse(localStorage.getItem('rs.saved')) || []; } catch {}
+try { savedPosts = JSON.parse(localStorage.getItem('rs.saved')); } catch {}
+// re-slimming shrinks saves made before slimPost trimmed galleries
+savedPosts = Array.isArray(savedPosts) ? savedPosts.filter(p => p && p.id).map(slimPost) : [];
 const SAVED_MAX = 300;   // localStorage budget — oldest save drops past this
+// runtime fields are rebuilt on load and must never reach storage
 function persistSaved() {
-  try { localStorage.setItem('rs.saved', JSON.stringify(savedPosts)); }
-  catch { alert('Saved list is full — remove some saved posts in 👤'); }
+  try {
+    localStorage.setItem('rs.saved', JSON.stringify(savedPosts, (k, v) => (k === '_rv' || k === '_redgifs') ? undefined : v));
+    return true;
+  } catch {
+    alert('Saved list is full — remove some saved posts in 👤');
+    return false;
+  }
 }
 function isSaved(id) { return savedPosts.some(p => p.id === id); }
 // keep only the fields the slide builders actually read — full reddit post
@@ -110,8 +123,20 @@ function slimPost(post) {
   const p = {};
   for (const k of ['id', 'title', 'subreddit', 'author', 'ups', 'num_comments', 'permalink',
                    'created_utc', 'over_18', 'is_video', 'url', 'is_gallery',
-                   'gallery_data', 'media_metadata', 'domain']) {
+                   'gallery_data', 'domain', 'post_hint', 'savedAt']) {
     if (post[k] !== undefined) p[k] = post[k];
+  }
+  // galleries: the source plus one small rendition for the backdrop
+  if (post.media_metadata) {
+    p.media_metadata = {};
+    for (const [k, m] of Object.entries(post.media_metadata)) {
+      if (!m) continue;
+      p.media_metadata[k] = {
+        status: m.status, e: m.e, m: m.m,
+        s: m.s && { u: m.s.u, gif: m.s.gif, x: m.s.x, y: m.s.y },
+        p: m.p && m.p.length ? [m.p[0]] : undefined,
+      };
+    }
   }
   if (post.media && post.media.reddit_video) p.media = { reddit_video: post.media.reddit_video };
   const xp = post.crosspost_parent_list && post.crosspost_parent_list[0];
@@ -127,18 +152,22 @@ function slimPost(post) {
 function toggleSave(post, btn) {
   const i = savedPosts.findIndex(p => p.id === post.id);
   const sl = [...feed.children].find(x => x._post && x._post.id === post.id);
-  if (i >= 0) {
-    savedPosts.splice(i, 1);
+  const before = savedPosts.slice();
+  if (i >= 0) savedPosts.splice(i, 1);
+  else {
+    const sp = slimPost(post);
+    sp.savedAt = Date.now();
+    savedPosts.unshift(sp);
+    if (savedPosts.length > SAVED_MAX) savedPosts.pop();
+  }
+  if (!persistSaved()) savedPosts = before;
+  else if (i >= 0) {
     // only saved posts get cached: drop a pending download for this one
     const qi = sl && sl._mp4Url ? mp4CacheQueue.indexOf(sl._mp4Url) : -1;
     if (qi >= 0) mp4CacheQueue.splice(qi, 1);
-  } else {
-    savedPosts.unshift(slimPost(post));
-    if (savedPosts.length > SAVED_MAX) savedPosts.pop();
-    // the on-screen slide is queued by warmIO once it leaves the screen
-    if (sl && sl._mp4Url && sl !== currentSlide) queueMp4Cache(sl._mp4Url);
+  } else if (sl && sl._mp4Url && sl !== currentSlide) {
+    queueMp4Cache(sl._mp4Url);   // the on-screen slide is queued by warmIO once it leaves the screen
   }
-  persistSaved();
   if (btn) {
     const on = isSaved(post.id);
     btn.querySelector('.icon').textContent = on ? '💛' : '🔖';
@@ -1003,6 +1032,12 @@ function openEditor() {
   for (const preset of PRESET_FEEDS) {
     const b = el('button', 'editor-btn', preset.name);
     b.onclick = () => {
+      // ask before touching feeds: a cancelled tap must leave nothing behind
+      if (preset.nsfw && !showNsfw) {
+        if (!confirm('Turn on 18+ posts?')) return;
+        showNsfw = true;
+        persistNsfw();
+      }
       saveSubs();
       let idx = feeds.findIndex(f => f.name === preset.name);
       if (idx === -1) {
@@ -1012,10 +1047,6 @@ function openEditor() {
         // preset lists evolve — re-tapping merges new subs into your copy
         const have = new Set(feeds[idx].subs.map(s => s.toLowerCase()));
         for (const s of preset.subs) if (!have.has(s.toLowerCase())) feeds[idx].subs.push(s);
-      }
-      if (preset.nsfw && !showNsfw) {
-        showNsfw = true;
-        localStorage.setItem('rs.nsfw', '1');
       }
       overlay.remove();
       switchFeed(idx);
@@ -1071,7 +1102,7 @@ function openEditor() {
   nsfwToggle.checked = showNsfw;
   nsfwToggle.onchange = () => {
     showNsfw = nsfwToggle.checked;
-    localStorage.setItem('rs.nsfw', showNsfw ? '1' : '0');
+    persistNsfw();
   };
   nsfwRow.appendChild(nsfwToggle);
   card.appendChild(nsfwRow);
@@ -1101,7 +1132,7 @@ function openEditor() {
       } else throw 0;
       subs = feeds[activeFeed].subs;
       showNsfw = !!j.nsfw;
-      localStorage.setItem('rs.nsfw', showNsfw ? '1' : '0');
+      persistNsfw();
       nsfwToggle.checked = showNsfw;
       saveSubs();
       renderFeeds();
@@ -1211,19 +1242,29 @@ function enterSavedFeed(startId) {
   currentSub = null;
   clearFeed();
   highlightChip('profile');
-  let target = null;
-  for (const p of savedPosts) {
-    const rv = videoInfoOf(p);
-    if (rv) p._rv = rv;
+  let target = null, hidden = 0;
+  for (const orig of savedPosts) {
+    if (orig.over_18 && !showNsfw) { hidden++; continue; }
+    // runtime fields go on a copy so they never reach storage
+    const p = { ...orig };
+    delete p._rv; delete p._redgifs;
     const rg = (p.url || '').match(/redgifs\.com\/(?:watch|ifr)\/([a-z0-9]+)/i);
     if (rg) p._redgifs = rg[1].toLowerCase();
+    const rv = videoInfoOf(p);
+    if (rv) p._rv = rv;
+    else if (p._redgifs) p._rv = {};   // same as usablePosts: original only
+    // saves from before post_hint was kept: a preview is enough for a still
+    else if (!p.post_hint && !(p.is_gallery && p.media_metadata) && posterOf(p)) p.post_hint = 'image';
     const slide = buildSlide(p);
     if (slide) {
       feed.appendChild(slide);
       if (p.id === startId) target = slide;
     }
   }
-  if (feed.children.length === 0) return showStatus('Nothing saved yet — tap 🔖 on any post', false);
+  if (feed.children.length === 0) {
+    return showStatus(hidden ? 'Saved 18+ posts are hidden — turn on "Show 18+ posts" in ＋'
+                             : 'Nothing saved yet — tap 🔖 on any post', false);
+  }
   hideStatus();
   if (target) target.scrollIntoView();
 }
@@ -1233,17 +1274,18 @@ function openProfile() {
   const card = el('div', 'editor-card');
   card.appendChild(el('div', 'editor-title', '👤 Profile'));
 
-  card.appendChild(el('div', 'editor-sect', `Saved posts (${savedPosts.length})`));
-  if (savedPosts.length) {
-    const watch = el('button', 'editor-btn editor-done', '▶ Watch saved feed');
-    watch.onclick = () => { overlay.remove(); enterSavedFeed(); };
-    card.appendChild(watch);
-  }
+  const sect = el('div', 'editor-sect');
+  card.appendChild(sect);
+  const watch = el('button', 'editor-btn editor-done', '▶ Watch saved feed');
+  watch.onclick = () => { overlay.remove(); enterSavedFeed(); };
+  card.appendChild(watch);
   const grid = el('div', 'saved-grid');
   const render = () => {
     grid.replaceChildren();
-    if (!savedPosts.length) grid.appendChild(el('div', null, 'Nothing saved yet — tap 🔖 on any post'));
+    let visible = 0, hidden = 0;
     for (const p of savedPosts) {
+      if (p.over_18 && !showNsfw) { hidden++; continue; }
+      visible++;
       const c = el('div', 'saved-card');
       const img = document.createElement('img');
       img.loading = 'lazy';
@@ -1263,6 +1305,12 @@ function openProfile() {
       c.appendChild(rm);
       c.onclick = () => { overlay.remove(); enterSavedFeed(p.id); };
       grid.appendChild(c);
+    }
+    sect.textContent = `Saved posts (${visible}${hidden ? ', ' + hidden + ' hidden 18+' : ''})`;
+    watch.style.display = visible ? '' : 'none';
+    if (!visible) {
+      grid.appendChild(el('div', null, hidden ? 'Saved 18+ posts are hidden — turn on "Show 18+ posts" in ＋'
+                                              : 'Nothing saved yet — tap 🔖 on any post'));
     }
   };
   render();
@@ -1285,7 +1333,7 @@ function openProfile() {
    SOUND SELF-TEST — ＋ editor → "Sound debug"
    ======================================================================= */
 async function soundDebug() {
-  const slides = [...document.querySelectorAll('.slide')];
+  const slides = [...feed.querySelectorAll('.slide:not(.placeholder)')];
   const s = slides.find(x => x._video && !x._video.paused) || slides.find(x => x._video);
   if (!s) return alert('No video slide on screen — swipe to a video first');
   const v = s._video;
@@ -1599,7 +1647,7 @@ function armMp4(s, url) {
 function toggleSound() {
   soundOn = !soundOn;
   blessNearbyVideos();   // we're inside a tap — grant sound rights to nearby videos
-  document.querySelectorAll('.slide').forEach(s => {
+  feed.querySelectorAll('.slide:not(.placeholder)').forEach(s => {
     if (s._soundBtn) s._soundBtn.querySelector('.icon').textContent = soundOn ? '🔊' : '🔇';
     if (!s._video) return;
     if (s._audio) {           // mp4 + separate audio track
@@ -1853,7 +1901,27 @@ function onBecameCurrent(s) {
   if (!s._video || s._loadedOnce) openWarmGate();
   else warmGateTimer = setTimeout(openWarmGate, 2500);
   if (mp4Ctl) mp4Ctl.abort();   // background caching yields to the new slide
+  trimBehind(s);
   // later items append here
+}
+
+// Bound the live DOM: slides more than 8 behind the current one become
+// same-height placeholders (scroll position holds); warmIO rebuilds them from
+// their post if the user scrolls back up.
+function trimBehind(cur) {
+  let n = cur, k = 0;
+  while ((n = n.previousElementSibling)) {
+    if (n.classList.contains('placeholder')) break;
+    if (++k > 8) {
+      const prev = n.previousElementSibling;
+      teardownSlide(n);
+      const ph = el('div', 'slide placeholder');
+      ph._post = n._post;
+      n.replaceWith(ph);
+      n = ph;
+      if (prev && prev.classList.contains('placeholder')) break;
+    }
+  }
 }
 
 function isCentered(s) {
@@ -1927,7 +1995,9 @@ function promoteNextSlide(s) {
 const io = new IntersectionObserver(entries => {
   for (const e of entries) {
     const s = e.target;
-    if (s._dead) continue;   // records queued before teardown still arrive
+    // records queued before teardown still arrive; a placeholder never becomes
+    // current (warmIO swaps it for a real slide first)
+    if (s._dead || s.classList.contains('placeholder')) continue;
     if (e.isIntersecting && e.intersectionRatio >= 0.6 && s !== currentSlide) onBecameCurrent(s);
     if (!s._video) continue;
     if (e.isIntersecting && e.intersectionRatio >= 0.6) {
@@ -1964,7 +2034,14 @@ const io = new IntersectionObserver(entries => {
 const warmIO = new IntersectionObserver(entries => {
   for (const e of entries) {
     const s = e.target;
-    if (s._dead) continue;
+    if (s._dead) continue;   // incl. placeholders cleared by clearFeed
+    if (e.isIntersecting && s.classList.contains('placeholder')) {
+      warmIO.unobserve(s); io.unobserve(s);
+      // the fallback is not a placeholder, so a post that no longer builds can't loop
+      const ns = s._post && buildSlide(s._post);
+      s.replaceWith(ns || el('div', 'slide'));   // the MutationObserver observes the new node
+      continue;
+    }
     // posters and blurred backdrops load only once a slide is in warm range
     if (e.isIntersecting) {
       if (s._bd && s._bdEl && !s._bdSet) { s._bdSet = true; s._bdEl.style.backgroundImage = `url("${s._bd}")`; }
