@@ -95,8 +95,7 @@ function switchFeed(i) {
   activeFeed = Math.max(0, Math.min(i, feeds.length - 1));
   subs = feeds[activeFeed].subs;
   saveSubs();
-  rebuildTopbar();
-  enterMyFeed(true);
+  enterMyFeed(true);   // rebuilds the top bar once mode is 'my'
 }
 
 let showNsfw = false;
@@ -171,16 +170,18 @@ function toggleSave(post, btn) {
   } else if (sl && sl._mp4Url && sl !== currentSlide) {
     queueMp4Cache(sl._mp4Url);   // the on-screen slide is queued by warmIO once it leaves the screen
   }
-  if (btn) {
-    const on = isSaved(post.id);
-    btn.querySelector('.icon').textContent = on ? '💛' : '🔖';
-    btn.lastChild.textContent = on ? 'saved' : 'save';
-  }
+  if (btn) paintSave(btn, post.id);
+}
+function paintSave(btn, id) {
+  const on = isSaved(id);
+  btn.querySelector('.icon').textContent = on ? '💛' : '🔖';
+  btn.lastChild.textContent = on ? 'saved' : 'save';
 }
 
 /* ---------- session state ---------- */
-let mode = 'my';             // 'my' = mixed algorithmic feed, 'sub' = single subreddit
+let mode = 'my';             // 'my' = mixed algorithmic feed, 'sub' = single subreddit, 'saved'
 let currentSub = null;       // when mode === 'sub'
+let stash = null;            // the 'my' feed parked while saved or single-sub mode is open
 let loading = false;
 // bumped on every feed rebuild — in-flight loads from an older build drop their results
 let gen = 0;
@@ -851,6 +852,8 @@ async function myLoadMore() {
 }
 
 function enterMyFeed(reset) {
+  dropStash();
+  removeModePill();
   mode = 'my';
   currentSub = null;
   if (reset) {
@@ -865,7 +868,7 @@ function enterMyFeed(reset) {
     seen.clear();
     clearFeed();
   }
-  highlightChip('feed:' + activeFeed);
+  rebuildTopbar();   // drops a single-sub chip
   if (subs.length === 0) return showStatus(EMPTY_FEED_MSG, false, EDIT_FEEDS);
   if (!showNsfw && isNsfwFeed(feeds[activeFeed])) {
     return showStatus('This is an 18+ feed — turn on "Show 18+ posts" in ＋', false, { label: 'Open ＋', onClick: openEditor });
@@ -910,16 +913,26 @@ async function subLoadMore() {
 
 function enterSub(sub, resetSort) {
   newBuild();
+  stashFeed();   // before mode changes: only a 'my' feed is stashed
+  removeModePill();
   mode = 'sub';
   currentSub = sub;
   if (resetSort) subSortIdx = 0;
   subAfter = null;
   subExhausted = false;
   seen.clear();
-  clearFeed();
-  highlightChip(sub);
+  rebuildTopbar();   // adds the temporary r/sub chip
   const [sort, t] = SORTS[subSortIdx];
   showStatus(`Loading r/${sub} (${sort}${t ? ' · ' + t : ''})…`);
+  // a fresh visit, not a sort-cycling refresh, offers to keep the sub
+  const f = feeds[activeFeed];
+  const has = () => f.subs.some(x => x.toLowerCase() === sub.toLowerCase());
+  if (resetSort && !has()) {
+    toast('Watching r/' + sub, { action: '＋ Add to ' + f.name, ms: 5000, onAction: () => {
+      if (!has()) { f.subs.push(sub); saveSubs(); }
+      toast('Added ✓');
+    } });
+  }
   subLoadMore();
 }
 
@@ -953,7 +966,7 @@ function rebuildTopbar() {
   home.onclick = () => {
     const ov = document.querySelector('.editor-overlay');
     if (ov) { saveSubs(); ov._close ? ov._close() : ov.remove(); }
-    if (mode !== 'my') switchFeed(activeFeed);
+    if (mode !== 'my') restoreFeed();   // falls back to a fresh build when nothing is stashed
     else feed.scrollTo({ top: 0, behavior: 'smooth' });
   };
   topbar.appendChild(home);
@@ -972,11 +985,23 @@ function rebuildTopbar() {
   wrap.appendChild(strip);
   topbar.appendChild(wrap);
 
+  // sub: prefix — a sub named "home" or "profile" must not share a pinned chip's key
+  if (mode === 'sub' && currentSub) {
+    const c = el('button', 'chip', 'r/' + currentSub + ' ✕');
+    c.dataset.key = 'sub:' + currentSub;
+    c.title = 'Back to your feed';
+    c.onclick = restoreFeed;
+    strip.appendChild(c);
+  }
+
   feeds.forEach((f, i) => {
     if (isNsfwFeed(f) && !showNsfw && i !== activeFeed) return;
     const b = el('button', 'chip', f.name);
     b.dataset.key = 'feed:' + i;
-    b.onclick = () => { if (i !== activeFeed || mode !== 'my') switchFeed(i); };
+    b.onclick = () => {
+      if (i === activeFeed && mode !== 'my' && stash) restoreFeed();
+      else if (i !== activeFeed || mode !== 'my') switchFeed(i);
+    };
     strip.appendChild(b);
   });
 
@@ -993,7 +1018,7 @@ function rebuildTopbar() {
   edit.onclick = openEditor;
   topbar.appendChild(edit);
 
-  highlightChip(mode === 'my' ? 'feed:' + activeFeed : mode === 'saved' ? 'profile' : currentSub);
+  highlightChip(mode === 'my' ? 'feed:' + activeFeed : mode === 'saved' ? 'profile' : 'sub:' + currentSub);
 }
 function highlightChip(key) {
   let active = null;
@@ -1267,6 +1292,8 @@ function openEditor() {
     const changed = snap() !== before;
     if (changed && subs.length === 0) {
       newBuild();    // an in-flight load of the old feed must not render behind the status
+      dropStash();
+      removeModePill();
       mode = 'my';
       currentSub = null;
       clearFeed();   // nothing may keep playing behind the status layer
@@ -1333,10 +1360,11 @@ async function downloadPost(post, s, btn) {
 
 function enterSavedFeed(startId) {
   newBuild();
+  stashFeed();   // before mode changes: only a 'my' feed is stashed
+  removeModePill();
   mode = 'saved';
   currentSub = null;
-  clearFeed();
-  highlightChip('profile');
+  rebuildTopbar();   // drops a single-sub chip
   let target = null, hidden = 0;
   for (const orig of savedPosts) {
     if (orig.over_18 && !showNsfw) { hidden++; continue; }
@@ -1356,13 +1384,26 @@ function enterSavedFeed(startId) {
       if (p.id === startId) target = slide;
     }
   }
-  if (feed.children.length === 0) {
+  const n = feed.children.length;
+  if (n === 0) {
     return showStatus(hidden ? 'Saved 18+ posts are hidden — turn on "Show 18+ posts" in ＋'
-                             : 'Nothing saved yet — tap 🔖 on any post', false);
+                             : 'Nothing saved yet — tap 🔖 on any post', false, BACK_TO_FEED);
   }
+  const end = el('div', 'slide end-card');
+  end.appendChild(el('div', null, "That's all your saves"));
+  const back = el('button', 'editor-btn', '← Back to feed');
+  back.onclick = e => { e.stopPropagation(); restoreFeed(); };
+  end.appendChild(back);
+  feed.appendChild(end);
+  const pill = el('button', null, `💛 Saved · ${n}  ✕`);
+  pill.id = 'mode-pill';
+  pill.title = 'Back to your feed';
+  pill.onclick = () => restoreFeed();
+  document.body.appendChild(pill);
   hideStatus();
   if (target) target.scrollIntoView();
 }
+function removeModePill() { document.getElementById('mode-pill')?.remove(); }
 
 function openProfile() {
   const overlay = el('div', 'editor-overlay');
@@ -1484,6 +1525,7 @@ function showStatus(msg, spin = true, action) {
 }
 function hideStatus() { statusEl.classList.add('hidden'); }
 const EDIT_FEEDS = { label: 'Edit feeds', onClick: openEditor };
+const BACK_TO_FEED = { label: '← Back to feed', onClick: () => restoreFeed() };
 const EMPTY_FEED_MSG = 'This feed is empty — add subreddits';
 
 let toastEl = null, toastT = 0;
@@ -1502,6 +1544,7 @@ function toast(msg, { action, onAction, ms = 2500 } = {}) {
 }
 statusEl.addEventListener('click', () => {
   if (!loading && feed.children.length === 0) {
+    if (mode === 'saved') return;   // finite: there is nothing to retry
     // the empty and 18+ statuses stay: a retry would fetch the 18+ feed anyway
     if (mode === 'my' && (subs.length === 0 || (!showNsfw && isNsfwFeed(feeds[activeFeed])))) return;
     // un-blacklist subs a logged-out 403 (or a 404 blip) marked exhausted
@@ -1541,7 +1584,17 @@ function baseSlide(post, typeLabel) {
   s._kind = post._rv ? 'video' : (post.is_gallery ? 'gallery' : 'still');
 
   const overlay = el('div', 'overlay');
-  overlay.appendChild(el('div', 'sub', 'r/' + post.subreddit));
+  const subEl = el('div', 'sub', 'r/' + post.subreddit);
+  subEl.setAttribute('role', 'button');
+  subEl.tabIndex = 0;
+  subEl.title = 'More from r/' + post.subreddit;
+  subEl.onclick = e => {
+    e.stopPropagation();   // not a pause tap
+    if (mode === 'sub' && currentSub && currentSub.toLowerCase() === s._sub) return;
+    enterSub(post.subreddit, true);
+  };
+  subEl.onkeydown = e => { if (e.key === 'Enter') subEl.click(); };
+  overlay.appendChild(subEl);
   overlay.appendChild(el('div', 'title', post.title));
   overlay.appendChild(el('div', 'meta',
     `▲ ${fmt(post.ups)} · 💬 ${fmt(post.num_comments)} · u/${post.author}`));
@@ -1563,6 +1616,7 @@ function baseSlide(post, typeLabel) {
     toggleSave(post, saveBtn);
   });
   rail.appendChild(saveBtn);
+  s._saveBtn = saveBtn;
   const dlBtn = railButton('⬇', 'download', e => {
     e.stopPropagation();
     downloadPost(post, s, dlBtn);
@@ -1992,6 +2046,51 @@ function clearFeed() {
   warmGateOpen = false;   // a new feed's first slide gets the bandwidth alone
   clearTimeout(warmGateTimer);
 }
+// Saved and single-sub mode park the 'my' feed instead of destroying it, so
+// leaving them returns to the same slide without a refetch or reshuffle.
+// Call before mode changes; any other mode (or an empty feed) is just cleared,
+// so a refresh inside sub or saved mode never overwrites the stash.
+function stashFeed() {
+  if (mode !== 'my' || stash || !feed.children.length) return clearFeed();
+  const nodes = [...feed.children];
+  for (const s of nodes) {
+    if (s._enter && typeof logView === 'function') logView(s);   // logView lands with item 22
+    io.unobserve(s); warmIO.unobserve(s);   // re-observed by the MutationObserver on restore
+    s._warm = false;
+    releaseMedia(s);
+  }
+  stash = { nodes, top: feed.scrollTop, seen: new Set(seen) };   // enterSub clears seen
+  feed.replaceChildren();
+  feed.scrollTop = 0;
+  currentSlide = null;
+  warmGateOpen = false;
+  clearTimeout(warmGateTimer);
+}
+function dropStash() { if (stash) { stash.nodes.forEach(teardownSlide); stash = null; } }
+function restoreFeed() {
+  if (!stash) return switchFeed(activeFeed);
+  newBuild();
+  clearFeed();
+  const st = stash;
+  stash = null;
+  removeModePill();
+  mode = 'my';
+  currentSub = null;
+  my.announced = gen;   // the persona toast already ran for this feed
+  seen.clear();
+  st.seen.forEach(id => seen.add(id));
+  for (const s of st.nodes) if (s._saveBtn) paintSave(s._saveBtn, s._post.id);   // saves may have changed
+  feed.replaceChildren(...st.nodes);
+  feed.scrollTop = st.top;
+  rebuildTopbar();
+  hideStatus();
+  const g = gen;
+  requestAnimationFrame(() => {
+    if (g !== gen) return;
+    feed.scrollTop = st.top;   // again once laid out: WebKit can drop the first set
+    maybeLoadMore();           // the build that would have topped up the feed was dropped
+  });
+}
 function onBecameCurrent(s) {
   currentSlide = s;
   armRedgifs(s);
@@ -2096,7 +2195,7 @@ const io = new IntersectionObserver(entries => {
     const s = e.target;
     // records queued before teardown still arrive; a placeholder never becomes
     // current (warmIO swaps it for a real slide first)
-    if (s._dead || s.classList.contains('placeholder')) continue;
+    if (s._dead || !s.isConnected || s.classList.contains('placeholder')) continue;
     if (e.isIntersecting && e.intersectionRatio >= 0.6 && s !== currentSlide) onBecameCurrent(s);
     if (!s._video) continue;
     if (e.isIntersecting && e.intersectionRatio >= 0.6) {
@@ -2133,7 +2232,7 @@ const io = new IntersectionObserver(entries => {
 const warmIO = new IntersectionObserver(entries => {
   for (const e of entries) {
     const s = e.target;
-    if (s._dead) continue;   // incl. placeholders cleared by clearFeed
+    if (s._dead || !s.isConnected) continue;   // incl. placeholders cleared by clearFeed, stashed slides
     if (e.isIntersecting && s.classList.contains('placeholder')) {
       warmIO.unobserve(s); io.unobserve(s);
       s._dead = true;   // a second record for it in this batch must not build again
@@ -2231,10 +2330,11 @@ new MutationObserver(muts => {
   }
 }).observe(feed, { childList: true });
 
-feed.addEventListener('scroll', () => {
+function maybeLoadMore() {
   const remaining = feed.scrollHeight - feed.scrollTop - feed.clientHeight;
   if (remaining < window.innerHeight * LOAD_MORE_AT) loadMore();
-}, { passive: true });
+}
+feed.addEventListener('scroll', maybeLoadMore, { passive: true });
 
 /* =======================================================================
    DEMO MODE (?demo in the URL) — sample media, no Reddit needed

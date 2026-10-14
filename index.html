@@ -115,6 +115,9 @@
     font-size: 14px;
     color: #ffd7a8;
     margin-bottom: 6px;
+    display: inline-block;   /* only the label is a tap target, not the whole row */
+    pointer-events: auto;    /* .overlay is pointer-events: none */
+    cursor: pointer;
   }
   .overlay .title {
     font-size: 15px;
@@ -221,6 +224,36 @@
   }
   .chip.icon { min-width: 40px; padding: 0 10px; }
   #refresh-chip.busy { animation: spin .8s linear infinite; }
+
+  /* ---------- saved mode: exit pill + end card ---------- */
+  #mode-pill {
+    position: fixed;
+    top: calc(env(safe-area-inset-top, 0px) + 62px);
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 21;
+    padding: 7px 14px;
+    border-radius: 999px;
+    border: 1px solid rgba(255,255,255,.35);
+    background: rgba(0,0,0,.55);
+    backdrop-filter: blur(8px);
+    color: #fff;
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    white-space: pre;
+    cursor: pointer;
+  }
+  /* the pill sits where gallery dots and type badges normally go */
+  body:has(#mode-pill) .dots,
+  body:has(#mode-pill) .type-badge { top: calc(env(safe-area-inset-top, 0px) + 104px); }
+  .end-card {
+    flex-direction: column;
+    gap: 16px;
+    padding: 24px;
+    text-align: center;
+    font-size: 17px;
+  }
 
   /* ---------- misc states ---------- */
   #status {
