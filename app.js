@@ -175,7 +175,10 @@ function toggleSave(post, btn) {
   } else if (sl && sl._mp4Url && sl !== currentSlide) {
     queueMp4Cache(sl._mp4Url, post.id);   // the on-screen slide is queued by warmIO once it leaves the screen
   }
-  if (ok) taste.event(post, i >= 0 ? -1.5 : 3);
+  // a save retracted on the same slide was never a signal, so toggling can't add up
+  if (ok && i < 0) { if (sl && sl._credit) sl._credit('save', 3); else taste.event(post, 3); }
+  else if (ok && sl && sl._credited && sl._credited.delete('save')) taste.undo(post, 3);
+  else if (ok) taste.event(post, -1.5);
   if (btn) paintSave(btn, post.id);
 }
 function paintSave(btn, id) {
@@ -189,19 +192,34 @@ function paintSave(btn, id) {
 const TASTE_KEY = 'rs.taste', HALF_LIFE_D = 21, TASTE_MAX = 400;
 let T; try { T = JSON.parse(localStorage.getItem(TASTE_KEY)); } catch {}
 if (!T || T.v !== 1 || !T.subs || typeof T.subs !== 'object' || !T.fmt || typeof T.fmt !== 'object') T = { v: 1, off: false, seeded: false, subs: {}, fmt: {} };
+for (const m of [T.subs, T.fmt]) for (const k of Object.keys(m)) {
+  const e = m[k];
+  if (!Array.isArray(e) || e.length !== 4 || !e.every(Number.isFinite)) delete m[k];
+}
 const today = () => Math.floor(Date.now() / 864e5);
+// sub names like 'constructor' must not read Object.prototype members
+const own = (m, k) => Object.prototype.hasOwnProperty.call(m, k) ? m[k] : null;
 // entries are [pos, neg, events, day]
 function decayed(e) { const f = 0.5 ** ((today() - e[3]) / HALF_LIFE_D); return [e[0] * f, e[1] * f, e[2], today()]; }
 function bump(map, key, sig) {
-  if (!key || !sig) return;
-  const e = decayed(map[key] || [0, 0, 0, today()]);
+  if (!key || !sig || key === '__proto__') return;
+  const e = decayed(own(map, key) || [0, 0, 0, today()]);
   if (sig > 0) e[0] += sig; else e[1] -= sig;
   e[2]++;
   map[key] = e;
 }
+// takes back a positive bump exactly
+function unbump(map, key, sig) {
+  const e0 = key && own(map, key);
+  if (!e0) return;
+  const e = decayed(e0);
+  e[0] = Math.max(0, e[0] - sig);
+  e[2] = Math.max(0, e[2] - 1);
+  map[key] = e;
+}
 // Laplace-smoothed like ratio scaled by confidence, in (-1, 1)
 function aff(map, key) {
-  const e = map[key];
+  const e = own(map, key);
   if (!e) return 0;
   const [p, n] = decayed(e);
   return (2 * ((p + 2) / (p + n + 4)) - 1) * (1 - Math.exp(-(p + n) / 6));
@@ -211,8 +229,12 @@ function flushTaste() {
   clearTimeout(tasteT);
   tasteT = 0;
   const ks = Object.keys(T.subs);
-  const mass = k => T.subs[k][0] + T.subs[k][1];
-  if (ks.length > TASTE_MAX) ks.sort((a, b) => mass(b) - mass(a)).slice(TASTE_MAX).forEach(k => delete T.subs[k]);
+  if (ks.length > TASTE_MAX) {
+    // rank by decayed mass, computed once so the comparator stays consistent
+    const m = {};
+    for (const k of ks) { const [p, n] = decayed(T.subs[k]); m[k] = p + n; }
+    ks.sort((a, b) => m[b] - m[a]).slice(TASTE_MAX).forEach(k => delete T.subs[k]);
+  }
   try { localStorage.setItem(TASTE_KEY, JSON.stringify(T)); } catch {}
 }
 addEventListener('pagehide', flushTaste);
@@ -224,6 +246,12 @@ const taste = {
     if (T.off || !post || mode === 'saved') return;
     bump(T.subs, (post.subreddit || '').toLowerCase(), sig);
     bump(T.fmt, postKind(post), sig * 0.5);
+    if (!tasteT) tasteT = setTimeout(flushTaste, 3000);
+  },
+  undo(post, sig) {
+    if (T.off || !post || mode === 'saved') return;
+    unbump(T.subs, (post.subreddit || '').toLowerCase(), sig);
+    unbump(T.fmt, postKind(post), sig * 0.5);
     if (!tasteT) tasteT = setTimeout(flushTaste, 3000);
   },
   sub: s => T.off ? 0 : aff(T.subs, (s || '').toLowerCase()),
@@ -270,6 +298,7 @@ function rememberSeen(id) {
   if (k >= 0) seenRing.splice(k, 1);
   seenRing.push(id);
   if (seenRing.length > SEEN_MAX) seenRing.splice(0, seenRing.length - SEEN_MAX);
+  shownIds.add(id);   // watched in any mode: no build this session repeats it
   if (!seenT) seenT = setTimeout(flushSeen, 2000);
 }
 addEventListener('pagehide', () => { if (seenT) flushSeen(); });
@@ -908,7 +937,8 @@ function ensureBuffer() {
         if (g !== gen) return;                       // stale build: drop the page
         my.afters[sub] = data.data.after || null;
         if (isHidden(sub)) return;                   // hidden while its page was in flight
-        const posts = usablePosts(data, true);   // never re-show this session's posts
+        // never re-show this session's posts; aggregates like r/popular carry hidden subs' posts
+        const posts = usablePosts(data, true).filter(p => !isHidden(p.subreddit));
         my.videoYield[sub] = (my.videoYield[sub] || 0) + posts.filter(p => p._rv).length;
         my.buffer.push(...posts);
         notifyBuffer();
@@ -1013,6 +1043,7 @@ function enterMyFeed(reset) {
     my.videoYield = {};
     my.recycled = false;
     my.deepFills = 0;
+    seenRing.forEach(id => shownIds.add(id));   // a recycle cleared it for the last build only
     seen.clear();
     clearFeed();
   }
@@ -1078,6 +1109,7 @@ function enterSub(sub, resetSort) {
   if (resetSort && !has()) {
     toast('Watching r/' + sub, { action: '＋ Add to ' + f.name, ms: 5000, onAction: () => {
       if (!has()) { f.subs.push(sub); saveSubs(); }
+      if (hiddenSubs.delete(sub.toLowerCase())) saveHidden();
       toast('Added ✓');
     } });
   }
@@ -1336,6 +1368,7 @@ function openEditor() {
     const name = input.value.trim().replace(/^\/?(r\/)?/i, '');
     if (!/^[A-Za-z0-9_]{2,21}$/.test(name)) return alert('That does not look like a subreddit name');
     if (!subs.some(s => s.toLowerCase() === name.toLowerCase())) subs.push(name);
+    if (hiddenSubs.delete(name.toLowerCase())) { saveHidden(); renderHidden(); }
     input.value = '';
     expanded = true;   // the new sub lands at the end, past a collapsed list
     renderList();
@@ -2204,6 +2237,7 @@ function gallerySlide(post) {
     const f = el('div', 'frame');
     const img = document.createElement('img');
     img.loading = 'lazy';
+    if (!s._img) shownAt(s, img);
     img.src = u;
     f.appendChild(img);
     car.appendChild(f);
@@ -2251,6 +2285,12 @@ function gallerySlide(post) {
   return s;
 }
 
+// a still's view, like a video's, counts from when it first paints
+function shownAt(s, img) {
+  s._img = img;
+  img.addEventListener('load', () => { if (s._enter && s._ttff == null) s._ttff = performance.now() - s._enter; }, { once: true });
+}
+
 function pageCarousel(car, dir) {
   car.scrollBy({ left: dir * car.clientWidth, behavior: 'smooth' });
 }
@@ -2267,6 +2307,7 @@ function imageSlide(post) {
   const img = document.createElement('img');
   img.className = 'single';
   img.loading = 'lazy';
+  shownAt(s, img);
   const src = /\.gif$/i.test(url) ? url : (sizedPreview(post) || url);   // a preview of a gif is a still
   img.src = src;
   media.appendChild(img);
@@ -2414,7 +2455,7 @@ function releaseMedia(s, force) {
   v.preload = 'none';
 }
 function teardownSlide(s) {
-  if (s._enter) logView(s);
+  if (s._enter) logView(s, true);   // never a swipe: a tap on r/X, a refresh, a feed switch
   s._dead = true; io.unobserve(s); warmIO.unobserve(s); engageIO.unobserve(s);
   releaseMedia(s, true); clearTimeout(s._audChk);
   if (s._audio) { s._audio.removeAttribute('src'); s._audio.load(); }
@@ -2435,7 +2476,7 @@ function stashFeed() {
   if (mode !== 'my' || stash || !feed.children.length) return clearFeed();
   const nodes = [...feed.children];
   for (const s of nodes) {
-    if (s._enter) logView(s);
+    if (s._enter) logView(s, true);
     io.unobserve(s); warmIO.unobserve(s); engageIO.unobserve(s);   // re-observed by the MutationObserver on restore
     s._warm = false;
     releaseMedia(s);
@@ -2624,46 +2665,52 @@ const engageIO = new IntersectionObserver(es => {
     } else if (s._enter) logView(s);
   }
 }, { threshold: [0, 0.6] });
-function startView(s) {
+// resumed: the tab came back mid-view, so leaving soon after is not a skip
+function startView(s, resumed) {
   s._enter = performance.now();
   s._loops = 0;
   s._lastT = 0;
-  s._ttff = s._loadedOnce ? 0 : null;
+  s._ttff = s._video ? (s._loadedOnce ? 0 : null) : (s._img && s._img.complete && s._img.naturalWidth ? 0 : null);
   s._frames = s._frames || 1;
+  s._resumed = !!resumed;
 }
 
-// Turns one view into a taste signal. Video time only counts from the first
-// frame, and a slow start is skipped: that is the network, not the viewer.
-function logView(s) {
+// Turns one view into a taste signal. Time only counts from the first frame,
+// and a slow start is skipped: that is the network, not the viewer. A soft
+// exit (a tap elsewhere, a hidden page) is never read as a skip.
+function logView(s, soft) {
   const dwell = performance.now() - s._enter;
   s._enter = 0;
   const post = s._post;
   if (!post || s._mode === 'saved') return;
   if (dwell < 250) return;   // passed over by a programmatic scroll, not a choice
+  if (s._ttff == null) return;   // never painted: neither a view nor a verdict
+  const shown = dwell - s._ttff;
+  if (shown > 1500) rememberSeen(post.id);
+  if (s._ttff > 4000) return;
   let sig = 0;
   if (s._video) {
-    if (s._ttff == null || s._ttff > 4000) return;
     const dur = (s._rv && s._rv.duration) || s._video.duration || 15;
-    const watched = dwell - s._ttff;
-    const frac = watched / 1000 / dur;
-    sig = watched < 1500 ? -1
+    const frac = shown / 1000 / dur;
+    const quick = Math.min(1500, dur * 900);   // a short clip seen through once is not a skip
+    sig = shown < quick ? -1
       : (s._loops >= 1 || frac >= 0.9) ? 1 + 0.5 * Math.min(s._loops, 3)
       : Math.max(0, Math.min(frac, 0.9)) * 0.6;
   } else if (s._kind === 'gallery') {
-    sig = dwell < 800 ? -0.7 : 0.8 * s._frames / (s.querySelectorAll('.frame').length || 1);
-  } else sig = dwell < 800 ? -0.7 : dwell > 4000 ? 0.6 : 0;
+    sig = shown < 800 ? -0.7 : 0.8 * s._frames / (s.querySelectorAll('.frame').length || 1);
+  } else sig = shown < 800 ? -0.7 : shown > 4000 ? 0.6 : 0;
+  if ((soft || s._resumed) && sig < 0) sig = 0;
   taste.event(post, sig);
-  if (dwell > 1500) rememberSeen(post.id);
 }
 // the flush listeners above ran before this view was logged; WebKit may never
 // run their timers once backgrounded
 document.addEventListener('visibilitychange', () => {
   const s = currentSlide;
   if (document.hidden) {
-    if (s && s._enter) logView(s);
+    if (s && s._enter) logView(s, true);
     if (tasteT) flushTaste();
     if (seenT) flushSeen();
-  } else if (s && !s._enter && !s._dead && s.isConnected && isCentered(s)) startView(s);   // engageIO won't fire again for it
+  } else if (s && !s._enter && !s._dead && s.isConnected && isCentered(s)) startView(s, true);   // engageIO won't fire again for it
 });
 
 // warm-up: when a slide is within ~2.5 screens of the viewport, start
