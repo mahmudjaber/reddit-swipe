@@ -9,7 +9,13 @@
 <title>Reddit Swipe</title>
 <style>
   :root {
-    --overlay-grad: linear-gradient(to top, rgba(0,0,0,.75) 0%, rgba(0,0,0,.35) 40%, transparent 100%);
+    --overlay-grad: linear-gradient(to top, rgba(0,0,0,.82) 0%, rgba(0,0,0,.5) 45%, rgba(0,0,0,0) 100%);
+    /* desktop: a phone-width column; phones: the full width */
+    --col: min(100vw, max(420px, calc(100dvh * 9 / 16)));
+    --gutter: calc((100vw - var(--col)) / 2);
+    /* the notch only reaches the column when no gutter already clears it */
+    --inset-l: max(0px, calc(env(safe-area-inset-left, 0px) - var(--gutter)));
+    --inset-r: max(0px, calc(env(safe-area-inset-right, 0px) - var(--gutter)));
   }
   * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body {
@@ -30,8 +36,11 @@
   }
   #feed::-webkit-scrollbar { display: none; }
 
+  /* #feed stays full width so the wheel still scrolls over the gutters */
   .slide {
     position: relative;
+    width: var(--col);
+    margin-inline: auto;
     height: 100dvh;
     scroll-snap-align: start;
     scroll-snap-stop: always;
@@ -39,6 +48,10 @@
     align-items: center;
     justify-content: center;
     overflow: hidden;
+  }
+
+  @media (min-width: 700px) {
+    .slide { box-shadow: 1px 0 0 rgba(255,255,255,.06), -1px 0 0 rgba(255,255,255,.06); }
   }
 
   .slide video, .slide img.single {
@@ -100,12 +113,28 @@
     transition: background .2s, transform .2s;
   }
   .dots span.on { background: #fff; transform: scale(1.25); }
+  .car-nav {
+    position: absolute;
+    top: 50%;
+    transform: translateY(-50%);
+    z-index: 5;
+    width: 40px; height: 40px;
+    border-radius: 50%;
+    border: 0;
+    background: rgba(0,0,0,.45);
+    color: #fff;
+    font-size: 24px;
+    cursor: pointer;
+  }
+  .car-prev { left: 10px; }
+  .car-next { right: 64px; }   /* clears the rail */
+  @media (hover: none) { .car-nav { display: none; } }
 
   /* ---------- overlay info ---------- */
   .overlay {
     position: absolute;
     left: 0; right: 0; bottom: 0;
-    padding: 18px 74px calc(env(safe-area-inset-bottom, 0px) + 22px) 16px;
+    padding: 28px calc(var(--inset-r) + 74px) calc(env(safe-area-inset-bottom, 0px) + 22px) calc(var(--inset-l) + 16px);
     background: var(--overlay-grad);
     z-index: 4;
     pointer-events: none;
@@ -129,14 +158,15 @@
   }
   .overlay .meta {
     margin-top: 8px;
-    font-size: 12.5px;
-    color: rgba(255,255,255,.75);
+    font-size: 13px;
+    color: rgba(255,255,255,.88);
   }
+  .overlay, .rail button, .type-badge { text-shadow: 0 1px 2px rgba(0,0,0,.9), 0 0 6px rgba(0,0,0,.45); }
 
   /* ---------- right-side action rail ---------- */
   .rail {
     position: absolute;
-    right: 8px;
+    right: calc(var(--inset-r) + 8px);
     bottom: calc(env(safe-area-inset-bottom, 0px) + 30px);
     display: flex;
     flex-direction: column;
@@ -152,14 +182,16 @@
     flex-direction: column;
     align-items: center;
     gap: 3px;
-    font-size: 11px;
+    font-size: 11.5px;
+    font-weight: 600;
     font-family: inherit;
     cursor: pointer;
   }
   .rail .icon {
     width: 44px; height: 44px;
     border-radius: 50%;
-    background: rgba(255,255,255,.14);
+    background: rgba(0,0,0,.35);
+    border: 1px solid rgba(255,255,255,.2);
     backdrop-filter: blur(6px);
     display: flex;
     align-items: center;
@@ -170,8 +202,8 @@
   /* ---------- top bar: subreddit chips ---------- */
   #topbar {
     position: fixed;
-    top: 0; left: 0; right: 0;
-    padding: calc(env(safe-area-inset-top, 0px) + 10px) 10px 10px;
+    top: 0; left: var(--gutter); right: var(--gutter);
+    padding: calc(env(safe-area-inset-top, 0px) + 10px) calc(var(--inset-r) + 10px) 10px calc(var(--inset-l) + 10px);
     display: flex;
     align-items: center;
     gap: 8px;
@@ -304,6 +336,10 @@
     animation: spin .8s linear infinite;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) {
+    .spinner { animation-duration: 2s; }
+    .paused-badge, .dots span { transition: none; }
+  }
 
   .paused-badge {
     position: absolute;
@@ -321,7 +357,7 @@
   .type-badge {
     position: absolute;
     top: calc(env(safe-area-inset-top, 0px) + 62px);
-    right: 10px;
+    right: calc(var(--inset-r) + 10px);
     z-index: 5;
     font-size: 11px;
     padding: 4px 9px;
@@ -342,6 +378,15 @@
   }
   .slide.buffering .buffer-spinner { display: block; }
   .buffer-spinner .spinner { width: 40px; height: 40px; }
+
+  /* ---------- short and landscape viewports: a compact, label-free rail ---------- */
+  @media (max-height: 560px) {
+    .rail { gap: 8px; bottom: calc(env(safe-area-inset-bottom, 0px) + 12px); }
+    .rail button { font-size: 0; gap: 0; }
+    .rail .icon { width: 40px; height: 40px; font-size: 18px; }
+    .type-badge { right: calc(var(--inset-r) + 60px); }
+    .overlay .title { -webkit-line-clamp: 2; }
+  }
 
   /* ---------- subreddit editor ---------- */
   .editor-overlay {
@@ -397,7 +442,7 @@
   .preset-grid { display: flex; flex-wrap: wrap; gap: 6px; }
   .preset-grid .editor-btn { padding: 7px 11px; font-size: 13px; }
   .preset-grid .editor-btn.preset-have { opacity: .6; }
-  .editor-row.active-feed { outline: 1.5px solid #e05a33; border-radius: 8px; }
+  .editor-row.active-feed { outline: 1.5px solid #fff; outline-offset: -1.5px; }
   .saved-grid {
     display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
     gap: 8px;
@@ -410,7 +455,12 @@
   .saved-info { padding: 6px; }
   .saved-title { font-size: 11px; line-height: 1.25; max-height: 2.6em; overflow: hidden; }
   .saved-sub { font-size: 10px; opacity: .6; margin-top: 2px; }
-  .saved-card .editor-remove { position: absolute; top: 4px; right: 4px; }
+  .saved-card .editor-remove {
+    position: absolute; top: 4px; right: 4px;
+    width: 32px; height: 32px; padding: 0; border-radius: 50%;
+    background: rgba(0,0,0,.6); color: #fff;
+    display: flex; align-items: center; justify-content: center;
+  }
   .editor-list { display: flex; flex-direction: column; gap: 4px; }
   .editor-row {
     display: flex;
@@ -433,6 +483,8 @@
     cursor: pointer;
     padding: 4px 8px;
   }
+  .editor-row .editor-remove { min-width: 44px; min-height: 36px; margin: -8px -10px -8px 0; color: rgba(255,255,255,.75); }
+  .editor-hint { font-size: 12px; opacity: .6; }
   .editor-add { display: flex; gap: 8px; }
   .editor-add input {
     flex: 1;
@@ -443,7 +495,11 @@
     padding: 10px 12px;
     font-size: 15px;
     font-family: inherit;
-    outline: none;
+  }
+  .editor-add input:focus { outline: none; border-color: #ffd7a8; }
+  button:focus-visible, .saved-card:focus-visible, .overlay .sub:focus-visible {
+    outline: 2px solid #ffd7a8;
+    outline-offset: 2px;
   }
   .editor-btn {
     background: rgba(255,255,255,.14);

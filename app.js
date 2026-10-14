@@ -176,6 +176,7 @@ function paintSave(btn, id) {
   const on = isSaved(id);
   btn.querySelector('.icon').textContent = on ? '💛' : '🔖';
   btn.lastChild.textContent = on ? 'saved' : 'save';
+  btn.setAttribute('aria-label', on ? 'saved' : 'save');
 }
 
 /* ---------- session state ---------- */
@@ -1076,6 +1077,7 @@ function openEditor() {
       };
       row.appendChild(name);
       const rm = el('button', 'editor-remove', '✕');
+      rm.setAttribute('aria-label', 'Delete feed ' + f.name);
       rm.onclick = () => {
         if (feeds.length === 1) return alert('Keep at least one feed');
         if (!confirm(`Delete "${f.name}" (${f.subs.length} subs)?`)) return;
@@ -1128,6 +1130,7 @@ function openEditor() {
       const row = el('div', 'editor-row');
       row.appendChild(el('span', null, 'r/' + sub));
       const rm = el('button', 'editor-remove', '✕');
+      rm.setAttribute('aria-label', 'Remove r/' + sub);
       rm.onclick = () => {
         // splice, not filter: subs must stay the same array as feeds[activeFeed].subs
         const k = subs.indexOf(sub);
@@ -1279,6 +1282,10 @@ function openEditor() {
     cacheBtn.textContent = 'Video cache cleared ✓';
   };
   advanced.appendChild(cacheBtn);
+  if (matchMedia('(hover: hover)').matches) {
+    advanced.appendChild(el('div', 'editor-hint',
+      'Keys: ↑↓ / j k next · Space pause · ←→ gallery · m sound · s save · d download · r refresh · Esc close'));
+  }
   card.appendChild(advanced);
 
   done.onclick = () => {
@@ -1438,6 +1445,7 @@ function openProfile() {
       info.appendChild(el('div', 'saved-sub', 'r/' + p.subreddit));
       c.appendChild(info);
       const rm = el('button', 'editor-remove', '✕');
+      rm.setAttribute('aria-label', 'Unsave post');
       rm.onclick = e => {
         e.stopPropagation();
         savedPosts = savedPosts.filter(x => x.id !== p.id);
@@ -1446,6 +1454,9 @@ function openProfile() {
       };
       c.appendChild(rm);
       c.onclick = () => { overlay.remove(); enterSavedFeed(p.id); };
+      c.tabIndex = 0;
+      c.setAttribute('role', 'button');
+      c.onkeydown = e => { if (e.key === 'Enter' && e.target === c) c.click(); };
       grid.appendChild(c);
     }
     sect.textContent = `Saved posts (${visible}${hidden ? ', ' + hidden + ' hidden 18+' : ''})`;
@@ -1573,6 +1584,7 @@ function railButton(iconChar, label, onClick) {
   const b = el('button');
   b.appendChild(el('span', 'icon', iconChar));
   b.appendChild(document.createTextNode(label));
+  b.setAttribute('aria-label', label);
   b.onclick = onClick;
   return b;
 }
@@ -1622,6 +1634,7 @@ function baseSlide(post, typeLabel) {
     downloadPost(post, s, dlBtn);
   });
   rail.appendChild(dlBtn);
+  s._dlBtn = dlBtn;
   s.appendChild(rail);
 
   if (typeLabel) s.appendChild(el('div', 'type-badge', typeLabel));
@@ -1872,9 +1885,23 @@ function gallerySlide(post) {
   });
   s.appendChild(dots);
 
+  const nav = (dir, cls, label) => {
+    const b = el('button', 'car-nav ' + cls, dir < 0 ? '‹' : '›');
+    b.setAttribute('aria-label', label);
+    b.onclick = e => { e.stopPropagation(); pageCarousel(car, dir); };
+    s.appendChild(b);
+    return b;
+  };
+  const prev = nav(-1, 'car-prev', 'Previous image');
+  const next = nav(1, 'car-next', 'Next image');
+  prev.hidden = true;
+  next.hidden = urls.length < 2;
+
   const badge = s.querySelector('.type-badge');
   car.addEventListener('scroll', () => {
     const i = Math.round(car.scrollLeft / car.clientWidth);
+    prev.hidden = i === 0;
+    next.hidden = i >= urls.length - 1;
     dots.querySelectorAll('span').forEach((d, j) => d.classList.toggle('on', j === i));
     if (badge) badge.textContent = `📷 ${i + 1}/${urls.length}` + (i + 1 < urls.length ? ' — swipe →' : '');
     s._bdSet = true;   // warmIO must not reset it to the first frame
@@ -1882,6 +1909,10 @@ function gallerySlide(post) {
   }, { passive: true });
 
   return s;
+}
+
+function pageCarousel(car, dir) {
+  car.scrollBy({ left: dir * car.clientWidth, behavior: 'smooth' });
 }
 
 /* ----- single image ----- */
@@ -2339,6 +2370,44 @@ function maybeLoadMore() {
   if (remaining < window.innerHeight * LOAD_MORE_AT) loadMore();
 }
 feed.addEventListener('scroll', maybeLoadMore, { passive: true });
+
+/* ---------- desktop keyboard ---------- */
+function stepSlide(dir) {
+  const cur = currentSlide;
+  const t = cur && (dir > 0 ? cur.nextElementSibling : cur.previousElementSibling);
+  if (t) feed.scrollTo({ top: t.offsetTop, behavior: 'smooth' });
+}
+document.addEventListener('keydown', e => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const t = e.target;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+  const ov = document.querySelector('.editor-overlay');
+  if (ov) {
+    // both overlays close on a click whose target is the backdrop itself
+    if (e.key === 'Escape') { e.preventDefault(); ov.click(); }
+    return;
+  }
+  const cur = currentSlide;
+  const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+  switch (k) {
+    case 'ArrowDown': case 'j': case 'PageDown': if (!e.repeat) stepSlide(1); break;
+    case 'ArrowUp': case 'k': case 'PageUp': if (!e.repeat) stepSlide(-1); break;
+    case ' ': if (cur?._video) cur.click(); break;
+    case 'm': toggleSound(); break;
+    case 's': cur?._saveBtn?.click(); break;
+    case 'd': cur?._dlBtn?.click(); break;
+    case 'r': if (!loading) refresh(); break;
+    case 'ArrowLeft': case 'ArrowRight': {
+      const car = cur?.querySelector('.carousel');
+      if (car) pageCarousel(car, k === 'ArrowRight' ? 1 : -1);
+      break;
+    }
+    default: return;
+  }
+  e.preventDefault();
+  // a focused button would otherwise turn the next Space into its own click
+  if (document.activeElement instanceof HTMLButtonElement) document.activeElement.blur();
+});
 
 /* =======================================================================
    DEMO MODE (?demo in the URL) — sample media, no Reddit needed
