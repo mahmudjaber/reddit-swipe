@@ -1,4 +1,4 @@
-const APP_VERSION = '1.24.2';   // shown in the ＋ editor — bump with manifest.json
+const APP_VERSION = '1.24.3';   // shown in the ＋ editor — bump with manifest.json
 
 /* ================= CONFIG ================= */
 // Default subreddits for first launch — after that, edit your list in the app
@@ -33,6 +33,9 @@ const EXTENSION = location.protocol === 'chrome-extension:';
 const MAIN_ID = 'hemhjljcedomjkeidgiaekglfffaoidh';
 const OLD_IDS = ['lbciiccadfdecphekggnlbcdpfdjkbab', 'mkpiijeldfbcfkpffoeddofjljckpmme'];
 const RUNTIME_ID = EXTENSION && window.chrome && chrome.runtime ? chrome.runtime.id : '';
+// set when another tab restored a backup: this tab is about to reload, and its
+// in-memory state must never be written back over the merge
+let stale = false;
 // NB: don't trust canPlayType('application/vnd.apple.mpegurl') — Chrome
 // answers "maybe" but can't actually play HLS, leaving a frozen poster.
 const IS_SAFARI = /iPhone|iPad|iPod/.test(navigator.userAgent) ||
@@ -95,8 +98,8 @@ if (!Array.isArray(feeds) || feeds.length === 0 || !feeds.every(f => f && f.name
 let activeFeed = 0;
 try { activeFeed = parseInt(localStorage.getItem('rs.activeFeed'), 10) || 0; } catch {}
 if (activeFeed < 0 || activeFeed >= feeds.length) activeFeed = 0;
-// one-time, so deleting the combined feed sticks
-try {
+// one-time, so deleting the combined feed sticks; an old copy hands its data over untouched
+if (!OLD_IDS.includes(RUNTIME_ID)) try {
   if (!localStorage.getItem('rs.nsfwAll')) {
     let last = -1;
     feeds.forEach((f, i) => { if (isNsfwFeed(f)) last = i; });
@@ -111,6 +114,7 @@ try {
 } catch {}
 let subs = feeds[activeFeed].subs;   // alias the engine reads everywhere
 function saveSubs() {
+  if (stale) return false;
   feeds[activeFeed].subs = subs;
   try {
     localStorage.setItem('rs.feeds', JSON.stringify(feeds));
@@ -132,7 +136,7 @@ function persistNsfw() { try { localStorage.setItem('rs.nsfw', showNsfw ? '1' : 
 // lowercase names, hidden from the mixed feed only — single-sub mode still shows them
 let hiddenSubs = new Set();
 try { hiddenSubs = new Set((JSON.parse(localStorage.getItem('rs.hidden')) || []).filter(s => typeof s === 'string')); } catch {}
-const saveHidden = () => { try { localStorage.setItem('rs.hidden', JSON.stringify([...hiddenSubs])); } catch {} };
+const saveHidden = () => { if (stale) return; try { localStorage.setItem('rs.hidden', JSON.stringify([...hiddenSubs])); } catch {} };
 const isHidden = s => hiddenSubs.has((s || '').toLowerCase());
 
 /* ---------- saved posts (surface in 👤 Profile) ---------- */
@@ -143,6 +147,7 @@ savedPosts = Array.isArray(savedPosts) ? savedPosts.filter(p => p && p.id).map(p
 const SAVED_MAX = 300;   // localStorage budget — oldest save drops past this
 // runtime fields are rebuilt on load and must never reach storage
 function persistSaved() {
+  if (stale) return false;
   try {
     localStorage.setItem('rs.saved', JSON.stringify(savedPosts, (k, v) => (k === '_rv' || k === '_redgifs') ? undefined : v));
     return true;
@@ -255,6 +260,7 @@ let tasteT = 0;
 function flushTaste() {
   clearTimeout(tasteT);
   tasteT = 0;
+  if (stale) return;
   const ks = Object.keys(T.subs);
   if (ks.length > TASTE_MAX) {
     // rank by decayed mass, computed once so the comparator stays consistent
@@ -319,6 +325,7 @@ let seenT = 0;
 function flushSeen() {
   clearTimeout(seenT);
   seenT = 0;
+  if (stale) return;
   try { localStorage.setItem('rs.seen', JSON.stringify(seenRing)); } catch {}
 }
 function rememberSeen(id) {
@@ -545,7 +552,7 @@ const CACHE_OK = typeof caches !== 'undefined';
 
 let vidIndex = {};                          // videoId -> { at, bytes }
 try { vidIndex = JSON.parse(localStorage.getItem('rs.vidcache')) || {}; } catch {}
-const saveVidIndex = () => { try { localStorage.setItem('rs.vidcache', JSON.stringify(vidIndex)); } catch {} };
+const saveVidIndex = () => { if (stale) return; try { localStorage.setItem('rs.vidcache', JSON.stringify(vidIndex)); } catch {} };
 // LRU touches happen per fragment — batch them; size changes still save at once
 let vidSaveT = 0;
 const saveVidIndexSoon = () => { if (!vidSaveT) vidSaveT = setTimeout(() => { vidSaveT = 0; saveVidIndex(); }, 2000); };
@@ -1316,8 +1323,9 @@ function backupData() {
     saved: savedPosts, taste: T, hidden: [...hiddenSubs], seen: seenRing },
     (k, v) => (k === '_rv' || k === '_redgifs') ? undefined : v));
 }
-const isPristine = () => savedPosts.length === 0 && feeds.length === 1 && feeds[0].name === '⭐ My Feed' &&
-  feeds[0].subs.join() === DEFAULT_SUBREDDITS.join();
+const feedsPristine = () => feeds.length === 1 && feeds[0].name === '⭐ My Feed' && feeds[0].subs.join() === DEFAULT_SUBREDDITS.join();
+const isPristine = () => feedsPristine() && savedPosts.length === 0 && hiddenSubs.size === 0 && !showNsfw &&
+  Object.keys(T.subs).length === 0 && Object.keys(T.fmt).length === 0 && seenRing.length === 0;
 
 // merges, never replaces: feeds by name (sub lists unioned), saves/hidden/seen/taste
 // by key — existing saves are never evicted to make room for a backup's
@@ -1335,6 +1343,7 @@ function restoreBackup(j) {
   if (pristine) feeds = [];
   for (const f of inFeeds) {
     const name = f.name.slice(0, 40);
+    if (!pristine && name === '⭐ My Feed' && f.subs.join() === DEFAULT_SUBREDDITS.join()) continue;
     const good = f.subs.filter(okSub);
     let mine = feeds.find(x => x.name === name);
     if (!mine) {
@@ -2033,6 +2042,7 @@ function toast(msg, { action, onAction, ms = 2500 } = {}) {
   toastT = setTimeout(() => { toastEl?.remove(); toastEl = null; }, ms);
 }
 statusEl.addEventListener('click', () => {
+  if (OLD_IDS.includes(RUNTIME_ID)) return;
   if (!loading && feed.children.length === 0) {
     if (mode === 'saved') return;   // finite: there is nothing to retry
     if (mode === 'sub' && subExhausted) return;   // the listing ended with nothing playable
@@ -3142,37 +3152,78 @@ function demoPage(cursor) {
 }
 
 /* ---------- hand-over between installs ---------- */
-// an old copy sends its data to the pinned install instead of showing a feed
-function handOver() {
-  const n = feeds.length, k = savedPosts.length;
-  if (isPristine()) return showStatus('No old feeds or saves in this copy — nothing to move. You can remove this "(recovery)" copy.', false);
-  showStatus(`Moving ${n} feed${n === 1 ? '' : 's'} and ${k} save${k === 1 ? '' : 's'} to your main Reddit Swipe…`);
-  chrome.runtime.sendMessage(MAIN_ID, { type: 'rs-transfer', backup: backupData() }, res => {
+const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+// an old copy sends its data to the pinned install once, instead of showing a feed
+async function handOver(force) {
+  if (isPristine()) return showStatus('No old feeds, saves or settings in this copy — nothing to move. You can remove this "(recovery)" copy.', false);
+  const what = feedsPristine() && !savedPosts.length ? 'your settings and history'
+    : plural(feeds.length, 'feed') + ' and ' + plural(savedPosts.length, 'save');
+  const again = { label: 'Send again', onClick: () => handOver(true) };
+  let h = 0;
+  try { h = (await chrome.storage.local.get('handedOver')).handedOver || 0; } catch {}
+  if (h && !force) return showStatus(`Already sent ${what} to your main Reddit Swipe (${new Date(h).toLocaleString()}). Check it has everything there, then you can remove this copy.`, false, again);
+  showStatus(`Sending ${what} to your main Reddit Swipe…`);
+  chrome.runtime.sendMessage(MAIN_ID, { type: 'rs-transfer', backup: backupData(), force: !!force }, res => {
     if (chrome.runtime.lastError || !res || !res.ok) {
       return showStatus('Couldn\'t reach your main Reddit Swipe — update it (↻ on chrome://extensions), then reload this page. Or use ＋ → Advanced → 💾 Save backup file.', false, EDIT_FEEDS);
     }
-    showStatus(`✅ Moved ${n} feed${n === 1 ? '' : 's'} and ${k} save${k === 1 ? '' : 's'} — your main Reddit Swipe opened in a new tab. Keep this copy until you see them there, then remove it.`, false);
+    chrome.storage.local.set({ handedOver: Date.now() }).catch(() => {});
+    if (res.dup) return showStatus(`Already sent earlier (${new Date(res.at).toLocaleString()}). Check your main Reddit Swipe, then you can remove this copy.`, false, again);
+    showStatus(`✅ Sent ${what} — your main Reddit Swipe is open in another tab. Check the message there: if it says some saves didn't fit, keep this copy.`, false);
   });
 }
-// the pinned install merges whatever an old copy handed over
-async function takeOver() {
-  let got;
-  try { got = await chrome.storage.local.get('pendingRestore'); } catch { return; }
-  if (!got || !got.pendingRestore) return;
-  const r = restoreBackup(got.pendingRestore);
-  if (!r || !r.feedsOk) return toast('Could not merge your old feeds — storage is full', { ms: 8000 });
-  try { await chrome.storage.local.remove('pendingRestore'); } catch {}
+// the pinned install merges what old copies handed over, one tab at a time
+let bootRestoredAt = null;
+try { bootRestoredAt = localStorage.getItem('rs.restoredAt'); } catch {}
+function takeOver() {
+  return navigator.locks ? navigator.locks.request('rs-takeover', mergeHandedOver) : mergeHandedOver();
+}
+async function mergeHandedOver() {
+  let all;
+  try { all = await chrome.storage.local.get(null); } catch { return; }
+  const keys = Object.keys(all).filter(k => k.startsWith('pending:'));
+  if (!keys.length) return;
+  // another tab merged after this one loaded its state: merge from fresh state instead
+  let now = null;
+  try { now = localStorage.getItem('rs.restoredAt'); } catch {}
+  if (now !== bootRestoredAt) return location.reload();
+  const done = { ...(all.transferredFrom || {}) };
+  let nFeeds = 0, nSaved = 0, lost = 0;
+  for (const k of keys) {
+    const backup = all[k];
+    const r = restoreBackup(backup);
+    if (!r || !r.feedsOk) return toast('Could not merge your old feeds — storage is full', { ms: 10000 });
+    nFeeds += r.feeds;
+    nSaved += r.saved;
+    lost += r.savesOk ? r.skipped : (Array.isArray(backup.saved) ? backup.saved.length : 0);
+    done[k.slice('pending:'.length)] = Date.now();
+    try { await chrome.storage.local.remove(k); } catch {}
+  }
+  try { await chrome.storage.local.set({ transferredFrom: done }); } catch {}
+  try { bootRestoredAt = localStorage.getItem('rs.restoredAt'); } catch {}
   switchFeed(activeFeed);
   my.announced = gen;
-  toast(`Recovered ${r.feeds} feed${r.feeds === 1 ? '' : 's'} · ${r.saved} save${r.saved === 1 ? '' : 's'} from your old install`, { ms: 8000 });
+  const msg = `Recovered ${plural(nFeeds, 'feed')} · ${plural(nSaved, 'save')} from your old install`;
+  if (lost) toast(msg + ` · ${plural(lost, 'save')} didn't fit (max ${SAVED_MAX}). Keep the "(recovery)" copy: remove some saves here, then open it and tap Send again.`, { ms: 20000 });
+  else toast(msg, { ms: 8000 });
 }
 // another tab just restored a backup: this tab's in-memory state is stale
-addEventListener('storage', e => { if (e.key === 'rs.restoredAt') location.reload(); });
+addEventListener('storage', e => {
+  if (e.key !== 'rs.restoredAt') return;
+  stale = true;
+  location.reload();
+});
 
 /* ---------- go ---------- */
 rebuildTopbar();
-if (OLD_IDS.includes(RUNTIME_ID)) handOver();
+if (OLD_IDS.includes(RUNTIME_ID)) handOver(false);
 else {
   enterMyFeed(true);
-  if (RUNTIME_ID === MAIN_ID) takeOver();
+  if (RUNTIME_ID === MAIN_ID) {
+    takeOver();
+    // a hand-over can arrive while this tab is already open
+    chrome.storage.onChanged.addListener((c, area) => {
+      if (area === 'local' && Object.keys(c).some(k => k.startsWith('pending:') && c[k].newValue)) takeOver();
+    });
+  }
 }
