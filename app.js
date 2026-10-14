@@ -171,11 +171,9 @@ function toggleSave(post, btn) {
   const ok = persistSaved();
   if (!ok) savedPosts = before;
   else if (i >= 0) {
-    // only saved posts get cached: drop a pending download for this one
-    const qi = sl && sl._mp4Url ? mp4CacheQueue.indexOf(sl._mp4Url) : -1;
-    if (qi >= 0) mp4CacheQueue.splice(qi, 1);
+    dropMp4Cache(post.id);   // only saved posts get cached
   } else if (sl && sl._mp4Url && sl !== currentSlide) {
-    queueMp4Cache(sl._mp4Url);   // the on-screen slide is queued by warmIO once it leaves the screen
+    queueMp4Cache(sl._mp4Url, post.id);   // the on-screen slide is queued by warmIO once it leaves the screen
   }
   if (ok) taste.event(post, i >= 0 ? -1.5 : 3);
   if (btn) paintSave(btn, post.id);
@@ -625,43 +623,63 @@ async function setMp4Src(s, v, url) {
 
 // background write-through queue — one at a time, saved posts only;
 // onBecameCurrent aborts the download in flight and it retries later
-const mp4CacheQueue = [];
+const mp4CacheQueue = [];   // {url, id} — id is the saved post's id
 let mp4Caching = false;
 let mp4Ctl = null;
-function queueMp4Cache(url) {
-  if (!CACHE_OK || mp4CacheQueue.includes(url)) return;
-  mp4CacheQueue.push(url);
+let mp4CachingId = null;
+function queueMp4Cache(url, id) {
+  if (!CACHE_OK || mp4CacheQueue.some(q => q.url === url)) return;
+  mp4CacheQueue.push({ url, id });
   if (mp4CacheQueue.length > 5) mp4CacheQueue.shift();
   pumpMp4Cache();
+}
+// a post was unsaved: forget its queued download and cancel it if in flight
+function dropMp4Cache(id) {
+  for (let i = mp4CacheQueue.length - 1; i >= 0; i--) if (mp4CacheQueue[i].id === id) mp4CacheQueue.splice(i, 1);
+  if (mp4CachingId === id && mp4Ctl) mp4Ctl.abort();
 }
 async function pumpMp4Cache() {
   if (mp4Caching || mp4CacheQueue.length === 0) return;
   mp4Caching = true;
-  const url = mp4CacheQueue.shift();
-  let timedOut = false, t = 0;
+  const { url, id } = mp4CacheQueue.shift();
+  let timedOut = false, t = 0, ctl = null;
   try {
     const cache = await caches.open(VIDCACHE);
-    if (!await cache.match(cacheKeyOf(url))) {
-      const ctl = mp4Ctl = new AbortController();
+    if (isSaved(id) && !await cache.match(cacheKeyOf(url))) {
+      mp4CachingId = id;
+      ctl = mp4Ctl = new AbortController();
       t = setTimeout(() => { timedOut = true; ctl.abort(); }, 30000);
       const res = await fetch(url, { signal: ctl.signal, priority: 'low' });
       const len = +res.headers.get('content-length') || 0;
       if (res.ok && (!len || len < MP4_CACHE_MAX)) {
-        const buf = await res.arrayBuffer();
+        // read in chunks so a body with no length stops at the cap
+        const r = res.body.getReader();
+        const parts = [];
+        let n = 0;
+        for (;;) {
+          const { done, value } = await r.read();
+          if (done) break;
+          n += value.byteLength;
+          if (n >= MP4_CACHE_MAX) break;
+          parts.push(value);
+        }
         clearTimeout(t);
-        if (buf.byteLength < MP4_CACHE_MAX) {
-          await cache.put(cacheKeyOf(url), new Response(buf));
-          bumpVidIndex(vidIdOf(url), buf.byteLength);
+        if (n < MP4_CACHE_MAX && isSaved(id)) {
+          await cache.put(cacheKeyOf(url), new Response(new Blob(parts)));
+          bumpVidIndex(vidIdOf(url), n);
         }
       }
     }
   } catch (e) {
     // aborted by a swipe: try again later; a timeout means the link is too slow
-    if (e && e.name === 'AbortError' && !timedOut && !mp4CacheQueue.includes(url)) mp4CacheQueue.unshift(url);
+    if (e && e.name === 'AbortError' && !timedOut && isSaved(id) && !mp4CacheQueue.some(q => q.url === url)) mp4CacheQueue.unshift({ url, id });
   } finally {
     clearTimeout(t);
+    // an unread (not ok / oversized / capped) body would keep downloading
+    if (ctl) ctl.abort();
   }
   mp4Ctl = null;
+  mp4CachingId = null;
   mp4Caching = false;
   setTimeout(pumpMp4Cache, 8000);
 }
@@ -1604,6 +1622,7 @@ function openProfile() {
         e.stopPropagation();
         savedPosts = savedPosts.filter(x => x.id !== p.id);
         persistSaved();
+        dropMp4Cache(p.id);
         render();
       };
       c.appendChild(rm);
@@ -1986,10 +2005,12 @@ function videoSlide(post) {
   v.addEventListener('timeupdate', () => {
     if (s._enter && v.currentTime + 0.5 < s._lastT) s._loops++;
     s._lastT = v.currentTime;
+    // a fatal hls error only counts as healed once playback gets past where it struck
+    if (s._hlsFails && v.currentTime > Math.min(s._hlsErrAt, (v.duration || Infinity) - 0.5)) s._hlsFails = 0;
   });
 
   // first frame of the current slide opens the warm gate for its neighbours
-  const firstFrame = () => { s._loadedOnce = true; s._hlsFails = 0; if (s === currentSlide) openWarmGate(); };
+  const firstFrame = () => { s._loadedOnce = true; if (s === currentSlide) openWarmGate(); };
   v.addEventListener('canplay', firstFrame);
   v.addEventListener('playing', firstFrame);
 
@@ -2270,10 +2291,15 @@ function attachHls(s, current = false) {
     s._hlsErr = d.type + '/' + d.details + (d.fatal ? ' FATAL' : '');
     if (!d.fatal || s._hls !== h) return;
     s._hlsFails = (s._hlsFails || 0) + 1;
+    s._hlsErrAt = d.frag ? d.frag.start + d.frag.duration : s._video.currentTime + 5;
+    // recovery reloads the element, which pauses it and rejects a pending play()
+    const resume = () => { if (s._hls === h && s === currentSlide && !s.classList.contains('paused')) s._video.play().catch(() => {}); };
     const giveUp = () => {
       detachHls(s);
       s._hlsUrl = null;
       if (!s._fallbackUrl) return;
+      // full download ('auto') is only for the on-screen video
+      if (s !== currentSlide) s._video.preload = 'metadata';
       armMp4(s, s._fallbackUrl).then(() => {
         if (!s._dead && isCentered(s) && !s.classList.contains('paused')) s._video.play().catch(() => {});
       });
@@ -2287,6 +2313,7 @@ function attachHls(s, current = false) {
           if (s._hls !== h) return;
           h.loadSource(s._hlsUrl);
           if (s._loadStarted) h.startLoad(-1);
+          resume();
         }, 1000);
       } else if (s._loadStarted) h.startLoad();
     } else if (d.type === Hls.ErrorTypes.MEDIA_ERROR) {
@@ -2296,6 +2323,7 @@ function attachHls(s, current = false) {
       const t = s._video.currentTime;
       h.recoverMediaError();
       if (!t && s._loadStarted) h.startLoad(-1);
+      resume();
     } else giveUp();
   });
   // learn the network speed from real downloads only (not cache hits)
@@ -2312,6 +2340,8 @@ function attachHls(s, current = false) {
   h.loadSource(s._hlsUrl);
   h.attachMedia(s._video);
   s._hls = h;
+  s._hlsFails = 0;   // a fresh instance starts with a clean slate
+  s._hlsErrAt = 0;
   liveHls.add(s);
   s._loadStarted = false;
   if (current) startWarm(s);
@@ -2641,7 +2671,7 @@ const warmIO = new IntersectionObserver(entries => {
       releaseMedia(s);
       // a watched, saved mp4/redgifs video becomes a cache candidate now that
       // it's off-screen (the download still yields to every swipe)
-      if (s._played && s._mp4Url && isSaved(s._post && s._post.id)) queueMp4Cache(s._mp4Url);
+      if (s._played && s._mp4Url && isSaved(s._post && s._post.id)) queueMp4Cache(s._mp4Url, s._post.id);
     }
   }
 }, { root: feed, rootMargin: '150% 0px 150% 0px', threshold: 0 });
