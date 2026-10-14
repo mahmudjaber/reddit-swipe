@@ -178,7 +178,7 @@ let bufWaiters = [];
 function notifyBuffer(force) {
   const vids = my.buffer.reduce((c, p) => c + (p._rv ? 1 : 0), 0);
   const subsIn = new Set(my.buffer.map(p => p.subreddit)).size;
-  if (force || (my.buffer.length >= BATCH_SIZE && vids >= 4 && subsIn >= 3)) bufWaiters.splice(0).forEach(r => r());
+  if (force || (my.buffer.length >= BATCH_SIZE && vids >= 4 && subsIn >= Math.min(3, subs.length))) bufWaiters.splice(0).forEach(r => r());
 }
 const bufferReady = () => new Promise(r => { bufWaiters.push(r); notifyBuffer(); });
 
@@ -228,9 +228,11 @@ function withTimeout(ms) {
   };
 }
 
-function politeFetch(url, opts, timer) {
+// stale(): true once the caller's feed build is gone — the job is dropped
+// unsent so a switched or refreshed feed doesn't queue behind the old one
+function politeFetch(url, opts, timer, stale) {
   return new Promise((resolve, reject) => {
-    fetchQueue.push({ url, opts, timer, resolve, reject });
+    fetchQueue.push({ url, opts, timer, stale, resolve, reject });
     pumpQueue();
   });
 }
@@ -240,7 +242,7 @@ async function pumpQueue() {
   if (now < queuePausedUntil) { setTimeout(pumpQueue, queuePausedUntil - now); return; }
   if (activeFetches >= MAX_CONCURRENT || fetchQueue.length === 0) return;
   const job = fetchQueue.shift();
-  if (job.opts && job.opts.signal && job.opts.signal.aborted) {
+  if ((job.opts && job.opts.signal && job.opts.signal.aborted) || (job.stale && job.stale())) {
     job.reject(new DOMException('aborted', 'AbortError'));
     setTimeout(pumpQueue, 0);
     return;
@@ -251,11 +253,18 @@ async function pumpQueue() {
     const res = await fetch(job.url, job.opts);
     if (res.status === 429 && !job.retried) {
       const wait = Math.min(parseInt(res.headers.get('retry-after'), 10) || 15, 60);
-      queuePausedUntil = Date.now() + wait * 1000;   // global pause: the limit is per client
-      if (feed.children.length === 0) showStatus(`Reddit rate limit — retrying in ${wait}s…`);
       if (job.timer) job.timer.done();
       job.retried = true;
-      fetchQueue.unshift(job);
+      if (job.url.startsWith('https://api.redgifs.com/')) {
+        // redgifs' limit is its own — it must not pause reddit listings
+        setTimeout(() => { fetchQueue.push(job); pumpQueue(); }, wait * 1000);
+      } else {
+        queuePausedUntil = Date.now() + wait * 1000;   // global pause: the limit is per client
+        if (feed.children.length === 0 && !(job.stale && job.stale())) {
+          showStatus(`Reddit rate limit — retrying in ${wait}s…`);
+        }
+        fetchQueue.unshift(job);
+      }
     } else job.resolve(res);
   } catch (e) {
     job.reject(e);
@@ -276,7 +285,7 @@ function pageCachePut(url, json) {
   while (pageCache.size > PAGE_CACHE_MAX) pageCache.delete(pageCache.keys().next().value);
 }
 
-async function fetchSubPage(sub, sort, t, cursor) {
+async function fetchSubPage(sub, sort, t, cursor, stale) {
   if (DEMO) return demoPage(cursor);
   const qs = `limit=${PAGE_SIZE}&raw_json=1` +
              (cursor ? `&after=${encodeURIComponent(cursor)}` : '') +
@@ -294,7 +303,7 @@ async function fetchSubPage(sub, sort, t, cursor) {
   for (let attempt = 0; ; attempt++) {
     const to = withTimeout(15000);
     try {
-      const res = await politeFetch(url, { ...(EXTENSION ? { credentials: 'include' } : {}), signal: to.signal }, to);
+      const res = await politeFetch(url, { ...(EXTENSION ? { credentials: 'include' } : {}), signal: to.signal }, to, stale);
       if (!res.ok) {
         if (EXTENSION) {
           throw new Error('Reddit responded HTTP ' + res.status +
@@ -517,21 +526,28 @@ const rgCache = new Map();
 async function resolveRedgifs(id) {
   if (rgCache.has(id)) return rgCache.get(id);
   for (let attempt = 0; attempt < 2; attempt++) {
-    if (!rgToken) {
-      const r = await politeFetch('https://api.redgifs.com/v2/auth/temporary');
-      rgToken = (await r.json()).token;
+    // these share the listing queue — a stalled one must not hold a slot forever
+    const to = withTimeout(15000);
+    try {
+      if (!rgToken) {
+        const r = await politeFetch('https://api.redgifs.com/v2/auth/temporary', { signal: to.signal }, to);
+        rgToken = (await r.json()).token;
+      }
+      const r = await politeFetch('https://api.redgifs.com/v2/gifs/' + encodeURIComponent(id), {
+        headers: { Authorization: 'Bearer ' + rgToken },
+        signal: to.signal,
+      }, to);
+      if (r.status === 401) { rgToken = null; continue; }   // token expired — retry once
+      if (!r.ok) break;
+      const j = await r.json();
+      // SD first: on a swipe feed, time-to-first-frame beats resolution — HD
+      // files run 10-30MB and crawl on weak connections
+      const url = (j && j.gif && j.gif.urls && (j.gif.urls.sd || j.gif.urls.hd)) || null;
+      rgCache.set(id, url);
+      return url;
+    } finally {
+      to.done();
     }
-    const r = await politeFetch('https://api.redgifs.com/v2/gifs/' + encodeURIComponent(id), {
-      headers: { Authorization: 'Bearer ' + rgToken },
-    });
-    if (r.status === 401) { rgToken = null; continue; }   // token expired — retry once
-    if (!r.ok) break;
-    const j = await r.json();
-    // SD first: on a swipe feed, time-to-first-frame beats resolution — HD
-    // files run 10-30MB and crawl on weak connections
-    const url = (j && j.gif && j.gif.urls && (j.gif.urls.sd || j.gif.urls.hd)) || null;
-    rgCache.set(id, url);
-    return url;
   }
   rgCache.set(id, null);
   return null;
@@ -665,7 +681,7 @@ function ensureBuffer() {
       pending.sort((a, b) => rank(a) - rank(b) || ord(a) - ord(b));
       const results = await Promise.allSettled(pending.map(async sub => {
         const [sort, t] = my.sorts[sub] || ['hot', null];
-        const data = await fetchSubPage(sub, sort, t, my.afters[sub]);
+        const data = await fetchSubPage(sub, sort, t, my.afters[sub], () => g !== gen);
         if (g !== gen) return;                       // stale build: drop the page
         my.afters[sub] = data.data.after || null;
         const posts = usablePosts(data, true);   // never re-show this session's posts
@@ -764,7 +780,7 @@ async function subLoadMore() {
   const g = gen;
   try {
     const [sort, t] = SORTS[subSortIdx];
-    const data = await fetchSubPage(currentSub, sort, t, subAfter);
+    const data = await fetchSubPage(currentSub, sort, t, subAfter, () => g !== gen);
     if (g !== gen || mode !== 'sub') return;
     subAfter = data.data.after;
     if (!subAfter) subExhausted = true;
@@ -779,8 +795,9 @@ async function subLoadMore() {
       showStatus('No playable video/image posts found in r/' + currentSub, false);
     }
   } catch (err) {
+    if (g !== gen) return;   // the build was replaced (its queued fetch was dropped)
     console.error(err);
-    if (g === gen && feed.children.length === 0) {
+    if (feed.children.length === 0) {
       showStatus('Could not load r/' + currentSub + ' — ' + err.message, false);
     }
   } finally {
