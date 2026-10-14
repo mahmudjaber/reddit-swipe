@@ -1045,6 +1045,7 @@ function openEditor() {
         activeFeed = i;
         subs = feeds[i].subs;
         saveSubs();
+        expanded = false;
         renderFeeds();
         renderList();
       };
@@ -1163,6 +1164,7 @@ function openEditor() {
         feeds.push({ name: preset.name, subs: preset.subs.slice(), nsfw: !!preset.nsfw });
         idx = feeds.length - 1;
       }
+      if (idx === activeFeed && mode === 'my') return done.onclick();   // already watching it
       close();
       switchFeed(idx);
     };
@@ -1500,6 +1502,8 @@ function toast(msg, { action, onAction, ms = 2500 } = {}) {
 }
 statusEl.addEventListener('click', () => {
   if (!loading && feed.children.length === 0) {
+    // the empty and 18+ statuses stay: a retry would fetch the 18+ feed anyway
+    if (mode === 'my' && (subs.length === 0 || (!showNsfw && isNsfwFeed(feeds[activeFeed])))) return;
     // un-blacklist subs a logged-out 403 (or a 404 blip) marked exhausted
     if (mode === 'my') for (const s of subs) if (my.afters[s] === null) delete my.afters[s];
     showStatus('Retrying…');
