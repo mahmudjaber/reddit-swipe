@@ -126,12 +126,16 @@ function slimPost(post) {
 }
 function toggleSave(post, btn) {
   const i = savedPosts.findIndex(p => p.id === post.id);
-  if (i >= 0) savedPosts.splice(i, 1);
-  else {
+  const sl = [...feed.children].find(x => x._post && x._post.id === post.id);
+  if (i >= 0) {
+    savedPosts.splice(i, 1);
+    // only saved posts get cached: drop a pending download for this one
+    const qi = sl && sl._mp4Url ? mp4CacheQueue.indexOf(sl._mp4Url) : -1;
+    if (qi >= 0) mp4CacheQueue.splice(qi, 1);
+  } else {
     savedPosts.unshift(slimPost(post));
     if (savedPosts.length > SAVED_MAX) savedPosts.pop();
     // the on-screen slide is queued by warmIO once it leaves the screen
-    const sl = [...feed.children].find(x => x._post && x._post.id === post.id);
     if (sl && sl._mp4Url && sl !== currentSlide) queueMp4Cache(sl._mp4Url);
   }
   persistSaved();
@@ -449,7 +453,7 @@ function makeCacheFragLoader() {
         st.loading.end = now;
         st.loaded = st.total = data.byteLength;
         st._fromCache = true;
-        queueMicrotask(() => callbacks.onSuccess({ url: context.url, data }, st, context, null));
+        queueMicrotask(() => { if (!this._cacheCancelled) callbacks.onSuccess({ url: context.url, data }, st, context, null); });
       }).catch(net);
     }
   };
@@ -1785,7 +1789,11 @@ function attachHls(s, current = false) {
       } else if (s._loadStarted) h.startLoad();
     } else if (d.type === Hls.ErrorTypes.MEDIA_ERROR) {
       if (s._hlsFails === 2) h.swapAudioCodec();
+      // recoverMediaError() only restarts loading from a non-zero currentTime;
+      // with autoStartLoad off, an error at 0 would otherwise stall for good
+      const t = s._video.currentTime;
       h.recoverMediaError();
+      if (!t && s._loadStarted) h.startLoad(-1);
     } else giveUp();
   });
   // learn the network speed from real downloads only (not cache hits)
@@ -1815,6 +1823,7 @@ let currentSlide = null;
 const liveHls = new Set();
 function releaseMedia(s, force) {
   detachHls(s);
+  s._loadedOnce = false;                      // buffer is gone: the warm gate waits again
   const v = s._video; if (!v) return;
   s._gen = (s._gen || 0) + 1;                 // cancels in-flight setMp4Src/redgifs
   v.pause(); if (s._audio) s._audio.pause();  // keep audio src: its candidate walk can't re-arm
