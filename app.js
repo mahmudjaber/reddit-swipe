@@ -2079,7 +2079,11 @@ function restoreFeed() {
   my.announced = gen;   // the persona toast already ran for this feed
   seen.clear();
   st.seen.forEach(id => seen.add(id));
-  for (const s of st.nodes) if (s._saveBtn) paintSave(s._saveBtn, s._post.id);   // saves may have changed
+  // saves and sound may have changed while parked (toggleSound only walks the live feed)
+  for (const s of st.nodes) {
+    if (s._saveBtn) paintSave(s._saveBtn, s._post.id);
+    if (s._soundBtn) s._soundBtn.querySelector('.icon').textContent = soundOn ? '🔊' : '🔇';
+  }
   feed.replaceChildren(...st.nodes);
   feed.scrollTop = st.top;
   rebuildTopbar();
