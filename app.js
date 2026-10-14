@@ -1,4 +1,4 @@
-const APP_VERSION = '1.24.1';   // shown in the ＋ editor — bump with manifest.json
+const APP_VERSION = '1.24.2';   // shown in the ＋ editor — bump with manifest.json
 
 /* ================= CONFIG ================= */
 // Default subreddits for first launch — after that, edit your list in the app
@@ -28,6 +28,11 @@ const DEMO = new URLSearchParams(location.search).has('demo');
 // Running as a Chrome extension page: host_permissions let us call reddit.com
 // directly with the user's own logged-in session — no proxy needed.
 const EXTENSION = location.protocol === 'chrome-extension:';
+// keep in sync with background.js — older installs loaded by folder path got
+// different ids, and their localStorage is unreachable from the pinned one
+const MAIN_ID = 'hemhjljcedomjkeidgiaekglfffaoidh';
+const OLD_IDS = ['lbciiccadfdecphekggnlbcdpfdjkbab', 'mkpiijeldfbcfkpffoeddofjljckpmme'];
+const RUNTIME_ID = EXTENSION && window.chrome && chrome.runtime ? chrome.runtime.id : '';
 // NB: don't trust canPlayType('application/vnd.apple.mpegurl') — Chrome
 // answers "maybe" but can't actually play HLS, leaving a frozen poster.
 const IS_SAFARI = /iPhone|iPad|iPod/.test(navigator.userAgent) ||
@@ -1305,6 +1310,15 @@ function fold(label, className) {
   return d;
 }
 
+function backupData() {
+  saveSubs(); flushTaste(); flushSeen();
+  return JSON.parse(JSON.stringify({ app: 'reddit-swipe', v: 1, at: Date.now(), feeds, activeFeed, nsfw: showNsfw,
+    saved: savedPosts, taste: T, hidden: [...hiddenSubs], seen: seenRing },
+    (k, v) => (k === '_rv' || k === '_redgifs') ? undefined : v));
+}
+const isPristine = () => savedPosts.length === 0 && feeds.length === 1 && feeds[0].name === '⭐ My Feed' &&
+  feeds[0].subs.join() === DEFAULT_SUBREDDITS.join();
+
 // merges, never replaces: feeds by name (sub lists unioned), saves/hidden/seen/taste
 // by key — existing saves are never evicted to make room for a backup's
 function restoreBackup(j) {
@@ -1373,6 +1387,7 @@ function restoreBackup(j) {
     if (!savesOk) { savedPosts = savedBefore; saved = 0; }
   }
   saveHidden(); flushSeen(); flushTaste();
+  try { localStorage.setItem('rs.restoredAt', String(Date.now())); } catch {}
   return { feeds: inFeeds.length, added, saved, skipped, feedsOk, savesOk };
 }
 
@@ -1573,10 +1588,7 @@ function openEditor() {
   const backupRow = el('div', 'editor-add');
   const exportBtn = el('button', 'editor-btn', '💾 Save backup file');
   exportBtn.onclick = () => {
-    saveSubs(); flushTaste(); flushSeen();
-    const data = { app: 'reddit-swipe', v: 1, at: Date.now(), feeds, activeFeed, nsfw: showNsfw,
-      saved: savedPosts, taste: T, hidden: [...hiddenSubs], seen: seenRing };
-    const json = JSON.stringify(data, (k, v) => (k === '_rv' || k === '_redgifs') ? undefined : v);
+    const json = JSON.stringify(backupData());
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
     a.download = 'reddit-swipe-backup-' + new Date().toISOString().slice(0, 10) + '.json';
@@ -3129,6 +3141,38 @@ function demoPage(cursor) {
   return { data: { after: 'demo-cursor-' + demoCount, children } };
 }
 
+/* ---------- hand-over between installs ---------- */
+// an old copy sends its data to the pinned install instead of showing a feed
+function handOver() {
+  const n = feeds.length, k = savedPosts.length;
+  if (isPristine()) return showStatus('No old feeds or saves in this copy — nothing to move. You can remove this "(recovery)" copy.', false);
+  showStatus(`Moving ${n} feed${n === 1 ? '' : 's'} and ${k} save${k === 1 ? '' : 's'} to your main Reddit Swipe…`);
+  chrome.runtime.sendMessage(MAIN_ID, { type: 'rs-transfer', backup: backupData() }, res => {
+    if (chrome.runtime.lastError || !res || !res.ok) {
+      return showStatus('Couldn\'t reach your main Reddit Swipe — update it (↻ on chrome://extensions), then reload this page. Or use ＋ → Advanced → 💾 Save backup file.', false, EDIT_FEEDS);
+    }
+    showStatus(`✅ Moved ${n} feed${n === 1 ? '' : 's'} and ${k} save${k === 1 ? '' : 's'} — your main Reddit Swipe opened in a new tab. Keep this copy until you see them there, then remove it.`, false);
+  });
+}
+// the pinned install merges whatever an old copy handed over
+async function takeOver() {
+  let got;
+  try { got = await chrome.storage.local.get('pendingRestore'); } catch { return; }
+  if (!got || !got.pendingRestore) return;
+  const r = restoreBackup(got.pendingRestore);
+  if (!r || !r.feedsOk) return toast('Could not merge your old feeds — storage is full', { ms: 8000 });
+  try { await chrome.storage.local.remove('pendingRestore'); } catch {}
+  switchFeed(activeFeed);
+  my.announced = gen;
+  toast(`Recovered ${r.feeds} feed${r.feeds === 1 ? '' : 's'} · ${r.saved} save${r.saved === 1 ? '' : 's'} from your old install`, { ms: 8000 });
+}
+// another tab just restored a backup: this tab's in-memory state is stale
+addEventListener('storage', e => { if (e.key === 'rs.restoredAt') location.reload(); });
+
 /* ---------- go ---------- */
 rebuildTopbar();
-enterMyFeed(true);
+if (OLD_IDS.includes(RUNTIME_ID)) handOver();
+else {
+  enterMyFeed(true);
+  if (RUNTIME_ID === MAIN_ID) takeOver();
+}
