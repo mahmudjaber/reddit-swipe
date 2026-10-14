@@ -102,6 +102,12 @@ let showNsfw = false;
 try { showNsfw = localStorage.getItem('rs.nsfw') === '1'; } catch {}
 function persistNsfw() { try { localStorage.setItem('rs.nsfw', showNsfw ? '1' : '0'); } catch {} }
 
+// lowercase names, hidden from the mixed feed only — single-sub mode still shows them
+let hiddenSubs = new Set();
+try { hiddenSubs = new Set((JSON.parse(localStorage.getItem('rs.hidden')) || []).filter(s => typeof s === 'string')); } catch {}
+const saveHidden = () => { try { localStorage.setItem('rs.hidden', JSON.stringify([...hiddenSubs])); } catch {} };
+const isHidden = s => hiddenSubs.has((s || '').toLowerCase());
+
 /* ---------- saved posts (surface in 👤 Profile) ---------- */
 let savedPosts = [];
 try { savedPosts = JSON.parse(localStorage.getItem('rs.saved')); } catch {}
@@ -162,7 +168,8 @@ function toggleSave(post, btn) {
     savedPosts.unshift(sp);
     if (savedPosts.length > SAVED_MAX) savedPosts.pop();
   }
-  if (!persistSaved()) savedPosts = before;
+  const ok = persistSaved();
+  if (!ok) savedPosts = before;
   else if (i >= 0) {
     // only saved posts get cached: drop a pending download for this one
     const qi = sl && sl._mp4Url ? mp4CacheQueue.indexOf(sl._mp4Url) : -1;
@@ -170,6 +177,7 @@ function toggleSave(post, btn) {
   } else if (sl && sl._mp4Url && sl !== currentSlide) {
     queueMp4Cache(sl._mp4Url);   // the on-screen slide is queued by warmIO once it leaves the screen
   }
+  if (ok) taste.event(post, i >= 0 ? -1.5 : 3);
   if (btn) paintSave(btn, post.id);
 }
 function paintSave(btn, id) {
@@ -177,6 +185,62 @@ function paintSave(btn, id) {
   btn.querySelector('.icon').textContent = on ? '💛' : '🔖';
   btn.lastChild.textContent = on ? 'saved' : 'save';
   btn.setAttribute('aria-label', on ? 'saved' : 'save');
+}
+
+/* ---------- taste: local, decaying per-sub and per-format affinity ---------- */
+const TASTE_KEY = 'rs.taste', HALF_LIFE_D = 21, TASTE_MAX = 400;
+let T; try { T = JSON.parse(localStorage.getItem(TASTE_KEY)); } catch {}
+if (!T || T.v !== 1 || typeof T.subs !== 'object' || typeof T.fmt !== 'object') T = { v: 1, off: false, seeded: false, subs: {}, fmt: {} };
+const today = () => Math.floor(Date.now() / 864e5);
+// entries are [pos, neg, events, day]
+function decayed(e) { const f = 0.5 ** ((today() - e[3]) / HALF_LIFE_D); return [e[0] * f, e[1] * f, e[2], today()]; }
+function bump(map, key, sig) {
+  if (!key || !sig) return;
+  const e = decayed(map[key] || [0, 0, 0, today()]);
+  if (sig > 0) e[0] += sig; else e[1] -= sig;
+  e[2]++;
+  map[key] = e;
+}
+// Laplace-smoothed like ratio scaled by confidence, in (-1, 1)
+function aff(map, key) {
+  const e = map[key];
+  if (!e) return 0;
+  const [p, n] = decayed(e);
+  return (2 * ((p + 2) / (p + n + 4)) - 1) * (1 - Math.exp(-(p + n) / 6));
+}
+let tasteT = 0;
+function flushTaste() {
+  clearTimeout(tasteT);
+  tasteT = 0;
+  const ks = Object.keys(T.subs);
+  const mass = k => T.subs[k][0] + T.subs[k][1];
+  if (ks.length > TASTE_MAX) ks.sort((a, b) => mass(b) - mass(a)).slice(TASTE_MAX).forEach(k => delete T.subs[k]);
+  try { localStorage.setItem(TASTE_KEY, JSON.stringify(T)); } catch {}
+}
+addEventListener('pagehide', flushTaste);
+document.addEventListener('visibilitychange', () => { if (document.hidden && tasteT) flushTaste(); });
+const postKind = p => p._rv ? (p._rv.is_gif || p._rv.has_audio === false ? 'gif' : 'video') : (p.is_gallery ? 'gallery' : 'image');
+// saved mode replays past choices, so it never teaches
+const taste = {
+  event(post, sig) {
+    if (T.off || !post || mode === 'saved') return;
+    bump(T.subs, (post.subreddit || '').toLowerCase(), sig);
+    bump(T.fmt, postKind(post), sig * 0.5);
+    if (!tasteT) tasteT = setTimeout(flushTaste, 3000);
+  },
+  sub: s => T.off ? 0 : aff(T.subs, (s || '').toLowerCase()),
+  fmt: k => T.off ? 0 : aff(T.fmt, k),
+  reset() { T = { v: 1, off: T.off, seeded: true, subs: {}, fmt: {} }; flushTaste(); },
+};
+// cold start: saves are the strongest signal there is
+if (!T.seeded) {
+  for (const p of savedPosts) {
+    const rv = videoInfoOf(p) || (/redgifs\.com\//i.test(p.url || '') ? {} : null);
+    bump(T.subs, (p.subreddit || '').toLowerCase(), 2);
+    bump(T.fmt, postKind({ _rv: rv, is_gallery: p.is_gallery }), 1);
+  }
+  T.seeded = true;
+  flushTaste();
 }
 
 /* ---------- session state ---------- */
@@ -191,7 +255,30 @@ function newBuild() { gen++; loading = false; my.fetchP = null; bufWaiters.splic
 function setBusy(on) { document.getElementById('refresh-chip')?.classList.toggle('busy', on); }
 let soundOn = false;        // global mute state (autoplay must start muted)
 const seen = new Set();      // per-feed-build fetch dedup
-const shownIds = new Set();  // everything shown this session — refresh won't repeat these
+
+// posts actually watched, across launches — newest last
+const SEEN_MAX = 1500;
+let seenRing = [];
+try { seenRing = JSON.parse(localStorage.getItem('rs.seen')) || []; } catch {}
+if (!Array.isArray(seenRing)) seenRing = [];
+let seenT = 0;
+function flushSeen() {
+  clearTimeout(seenT);
+  seenT = 0;
+  try { localStorage.setItem('rs.seen', JSON.stringify(seenRing)); } catch {}
+}
+function rememberSeen(id) {
+  const k = seenRing.indexOf(id);
+  if (k >= 0) seenRing.splice(k, 1);
+  seenRing.push(id);
+  if (seenRing.length > SEEN_MAX) seenRing.splice(0, seenRing.length - SEEN_MAX);
+  if (!seenT) seenT = setTimeout(flushSeen, 2000);
+}
+addEventListener('pagehide', () => { if (seenT) flushSeen(); });
+document.addEventListener('visibilitychange', () => { if (document.hidden && seenT) flushSeen(); });
+
+const shownIds = new Set();  // shown this session plus watched before — refresh won't repeat these
+seenRing.forEach(id => shownIds.add(id));
 
 // single-sub mode
 let subAfter = null;
@@ -222,7 +309,8 @@ let bufWaiters = [];
 function notifyBuffer(force) {
   const vids = my.buffer.reduce((c, p) => c + (p._rv ? 1 : 0), 0);
   const subsIn = new Set(my.buffer.map(p => p.subreddit)).size;
-  if (force || (my.buffer.length >= BATCH_SIZE && vids >= 4 && subsIn >= Math.min(3, subs.length))) bufWaiters.splice(0).forEach(r => r());
+  const live = subs.filter(s => !isHidden(s)).length;
+  if (force || (my.buffer.length >= BATCH_SIZE && vids >= 4 && subsIn >= Math.min(3, live))) bufWaiters.splice(0).forEach(r => r());
 }
 const bufferReady = () => new Promise(r => { bufWaiters.push(r); notifyBuffer(); });
 
@@ -231,12 +319,13 @@ const SORTS = [['hot', null], ['top', 'day'], ['rising', null], ['top', 'week']]
 // Every refresh rotates to the next persona: a different ranking character
 // (metric weights), different reddit sorts to pull from, and a different
 // video:still rhythm — so refreshes FEEL different, not just reshuffled.
+// w.taste scales the learned affinity; Lucky dip keeps it low to stay the discovery persona
 const PERSONAS = [
-  { name: '🔥 Trending now',     w: { pop: 0.5, buzz: 0.5, vel: 2.2, fresh: 2.4, jit: 0.8 }, vps: 3, sorts: [['hot', null], ['rising', null], ['top', 'day']] },
-  { name: '🏆 All-time bangers', w: { pop: 1.6, buzz: 0.6, vel: 0.3, fresh: 0.3, jit: 0.8 }, vps: 3, sorts: [['top', 'week'], ['top', 'month'], ['top', 'all']] },
-  { name: '🌱 Fresh finds',      w: { pop: 0.3, buzz: 0.3, vel: 1.2, fresh: 3.0, jit: 1.0 }, vps: 2, sorts: [['rising', null], ['new', null], ['hot', null]] },
-  { name: '🎲 Lucky dip',        w: { pop: 0.6, buzz: 0.3, vel: 0.6, fresh: 0.8, jit: 3.0 }, vps: 4, sorts: [['top', 'month'], ['hot', null], ['rising', null], ['top', 'week']] },
-  { name: '⚖️ Classic mix',      w: { pop: 0.8, buzz: 0.4, vel: 1.2, fresh: 2.0, jit: 1.2 }, vps: 3, sorts: SORTS },
+  { name: '🔥 Trending now',     w: { pop: 0.5, buzz: 0.5, vel: 2.2, fresh: 2.4, jit: 0.8, taste: 1.0 }, vps: 3, sorts: [['hot', null], ['rising', null], ['top', 'day']] },
+  { name: '🏆 All-time bangers', w: { pop: 1.6, buzz: 0.6, vel: 0.3, fresh: 0.3, jit: 0.8, taste: 1.2 }, vps: 3, sorts: [['top', 'week'], ['top', 'month'], ['top', 'all']] },
+  { name: '🌱 Fresh finds',      w: { pop: 0.3, buzz: 0.3, vel: 1.2, fresh: 3.0, jit: 1.0, taste: 0.8 }, vps: 2, sorts: [['rising', null], ['new', null], ['hot', null]] },
+  { name: '🎲 Lucky dip',        w: { pop: 0.6, buzz: 0.3, vel: 0.6, fresh: 0.8, jit: 3.0, taste: 0.4 }, vps: 4, sorts: [['top', 'month'], ['hot', null], ['rising', null], ['top', 'week']] },
+  { name: '💛 For you',          w: { pop: 0.8, buzz: 0.4, vel: 1.2, fresh: 2.0, jit: 1.2, taste: 1.5 }, vps: 3, sorts: SORTS },
 ];
 
 /* ---------- tiny DOM helper — all data-driven text via textContent ---------- */
@@ -694,8 +783,11 @@ function scorePost(p, seed) {
   const jitter = seededRand(seed ^ hashStr(p.id));
   const w = (my.persona && my.persona.w) || { pop: 0.8, buzz: 0.4, vel: 1.2, fresh: 2.0, jit: 1.2 };
   const spotlight = my.spotlight && p.subreddit && my.spotlight.has(p.subreddit.toLowerCase()) ? 0.8 : 0;
+  // quality gate: a liked sub's 3-upvote post must not beat a 50k one
+  const gate = Math.min(1, popularity / 2);
+  const tasteTerm = gate * Math.max(-1.5, Math.min(1.5, (w.taste ?? 1) * taste.sub(p.subreddit) + 0.4 * taste.fmt(postKind(p))));
   return popularity * w.pop + buzz * w.buzz + velocity * w.vel + freshness * w.fresh +
-         lengthFit + spotlight + jitter * w.jit;
+         lengthFit + spotlight + jitter * w.jit + tasteTerm;
 }
 
 function pickBatch(buffer, seed, n) {
@@ -739,14 +831,19 @@ function rotatedSortPlan() {
   my.personaIdx = (my.personaIdx + 1) % PERSONAS.length;
   my.persona = PERSONAS[my.personaIdx];
   my.sortCursor = (my.sortCursor + 1) % 9973;
-  const order = [...subs].sort((a, b) =>
-    seededRand(my.seed ^ hashStr(a)) - seededRand(my.seed ^ hashStr(b)));
+  // liked subs lead more often, but the seeded rotation still moves them around
+  const key = new Map(subs.map(s => [s, seededRand(my.seed ^ hashStr(s)) - 0.3 * taste.sub(s)]));
+  const order = subs.filter(s => !isHidden(s)).sort((a, b) => key.get(a) - key.get(b));
   my.order = order;
   const pool = my.persona.sorts;
   const plan = {};
   order.forEach((s, i) => { plan[s] = pool[(i + my.sortCursor) % pool.length]; });
-  my.spotlight = new Set(order.slice(0, Math.min(3, Math.ceil(order.length / 3)))
-    .map(s => s.toLowerCase()));
+  // the leaders plus one random sub from the rest, so the spotlight keeps exploring
+  const k = Math.min(3, Math.ceil(order.length / 3));
+  const spot = order.slice(0, k > 1 ? k - 1 : k);
+  const rest = order.slice(spot.length);
+  if (k > 1 && rest.length) spot.push(rest[Math.floor(seededRand(my.seed ^ 0x5f3759df) * rest.length)]);
+  my.spotlight = new Set(spot.map(s => s.toLowerCase()));
   return plan;
 }
 
@@ -763,21 +860,24 @@ function ensureBuffer() {
       if (g !== gen) return;
       const videoCount = my.buffer.reduce((c, p) => c + (p._rv ? 1 : 0), 0);
       if (my.buffer.length >= MIN_BUFFER && videoCount >= MIN_VIDEO_BUFFER) return;
-      let pending = subs.filter(s => my.afters[s] !== null); // null = exhausted
+      let pending = subs.filter(s => my.afters[s] !== null && !isHidden(s)); // null = exhausted
       if (round > 0) {
         const yielding = pending.filter(s => (my.videoYield[s] || 0) > 0);
         if (yielding.length) pending = yielding;
       }
       if (pending.length === 0) return;
-      // the queue is FIFO, so spotlight subs' listings come back first
+      // the queue is FIFO, so spotlight subs' listings come back first;
+      // deeper rounds spend the rate budget on liked subs first
       const rank = s => (my.spotlight && my.spotlight.has(s.toLowerCase()) ? 0 : 1);
       const ord = s => (my.order ? my.order.indexOf(s) : 0);
-      pending.sort((a, b) => rank(a) - rank(b) || ord(a) - ord(b));
+      const liked = new Map(pending.map(s => [s, round > 0 ? taste.sub(s) : 0]));
+      pending.sort((a, b) => liked.get(b) - liked.get(a) || rank(a) - rank(b) || ord(a) - ord(b));
       const results = await Promise.allSettled(pending.map(async sub => {
         const [sort, t] = my.sorts[sub] || ['hot', null];
         const data = await fetchSubPage(sub, sort, t, my.afters[sub], () => g !== gen);
         if (g !== gen) return;                       // stale build: drop the page
         my.afters[sub] = data.data.after || null;
+        if (isHidden(sub)) return;                   // hidden while its page was in flight
         const posts = usablePosts(data, true);   // never re-show this session's posts
         my.videoYield[sub] = (my.videoYield[sub] || 0) + posts.filter(p => p._rv).length;
         my.buffer.push(...posts);
@@ -831,7 +931,8 @@ async function myLoadMore() {
         const chip = topbar.querySelector(`[data-key="feed:${activeFeed}"]`);
         if (chip) chip.title = feeds[activeFeed].name + ' · ' + my.persona.name;
       }
-    } else if (subs.every(s => my.afters[s] === null)) {
+    } else if (subs.every(s => my.afters[s] === null || isHidden(s))) {
+      if (subs.length && subs.every(isHidden)) return showStatus('Every subreddit in this feed is hidden — unhide some in ＋ → Advanced', false, EDIT_FEEDS);
       // everything ever fetched was already shown this session — recycle once
       if (!my.recycled && shownIds.size) {
         my.recycled = true;
@@ -1048,6 +1149,7 @@ function openEditor() {
   // closing without changes must not rebuild (and refetch) the feed
   const snap = () => JSON.stringify({ feeds, activeFeed, showNsfw });
   const before = snap();
+  const hiddenBefore = hiddenSubs.size;
   const done = el('button', 'editor-btn editor-done editor-done-sm', 'Done');
   const onKey = e => { if (e.key === 'Escape') done.onclick(); };
   const close = () => { document.removeEventListener('keydown', onKey); overlay.remove(); };
@@ -1269,6 +1371,25 @@ function openEditor() {
   xferRow.appendChild(pasteBtn);
   advanced.appendChild(xferRow);
 
+  // hidden from ⋯ on a post; unhiding needs no rebuild — the next refill fetches it
+  advanced.appendChild(el('div', 'editor-sect', 'Hidden subreddits'));
+  const hiddenList = el('div', 'editor-list');
+  const renderHidden = () => {
+    hiddenList.replaceChildren();
+    if (!hiddenSubs.size) hiddenList.appendChild(el('div', 'editor-hint', 'None — hide one from ⋯ on any post'));
+    for (const sub of [...hiddenSubs].sort()) {
+      const row = el('div', 'editor-row');
+      row.appendChild(el('span', null, 'r/' + sub));
+      const rm = el('button', 'editor-remove', '✕');
+      rm.setAttribute('aria-label', 'Unhide r/' + sub);
+      rm.onclick = () => { hiddenSubs.delete(sub); saveHidden(); renderHidden(); };
+      row.appendChild(rm);
+      hiddenList.appendChild(row);
+    }
+  };
+  renderHidden();
+  advanced.appendChild(hiddenList);
+
   const dbg = el('button', 'editor-btn', 'Sound debug');
   dbg.onclick = () => { saveSubs(); close(); rebuildTopbar(); soundDebug(); };
   advanced.appendChild(dbg);
@@ -1308,7 +1429,8 @@ function openEditor() {
       return showStatus(EMPTY_FEED_MSG, false, EDIT_FEEDS);
     }
     rebuildTopbar();
-    if (changed) enterMyFeed(true);
+    // unhiding can revive a feed that was empty because every sub was hidden
+    if (changed || (hiddenSubs.size !== hiddenBefore && mode === 'my' && !feed.children.length)) enterMyFeed(true);
   };
   overlay._close = () => done.onclick();
 
@@ -1344,8 +1466,10 @@ async function downloadPost(post, s, btn) {
   const t = rg ? { url: rg, ext: '.mp4' } : downloadTargetOf(post, s);
   if (!t) {
     if (icon) icon.textContent = '⬇';
-    return alert('Nothing downloadable on this post');
+    alert('Nothing downloadable on this post');
+    return false;
   }
+  let ok = false;
   try {
     const res = await fetch(t.url);
     if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -1358,11 +1482,13 @@ async function downloadPost(post, s, btn) {
     a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 30_000);
     if (icon) icon.textContent = '✅';
+    ok = true;
   } catch (e) {
     if (icon) icon.textContent = '⚠️';
     alert('Download failed: ' + e.message);
   }
   setTimeout(() => { if (icon) icon.textContent = '⬇'; }, 2000);
+  return ok;
 }
 
 function enterSavedFeed(startId) {
@@ -1470,6 +1596,41 @@ function openProfile() {
   };
   render();
   card.appendChild(grid);
+
+  /* ----- your taste: what the mixer has learned ----- */
+  card.appendChild(el('div', 'editor-sect', 'Your taste'));
+  const tasteList = el('div', 'editor-list');
+  // stored keys are lowercase; show the casing the feeds use
+  const subName = k => feeds.flatMap(f => f.subs).find(s => s.toLowerCase() === k) || k;
+  const renderTaste = () => {
+    tasteList.replaceChildren();
+    const top = Object.keys(T.subs).map(k => [k, aff(T.subs, k)]).filter(x => x[1] > 0.05)
+      .sort((a, b) => b[1] - a[1]).slice(0, 5);
+    if (!top.length) tasteList.appendChild(el('div', 'editor-hint', 'Nothing learned yet — watch, save and share what you like'));
+    for (const [k, a] of top) {
+      const row = el('div', 'editor-row');
+      row.appendChild(el('span', null, 'r/' + subName(k)));
+      row.appendChild(el('span', null, '♥'.repeat(Math.max(1, Math.ceil(a * 3)))));
+      tasteList.appendChild(row);
+    }
+  };
+  renderTaste();
+  card.appendChild(tasteList);
+  const learnRow = el('label', 'editor-row');
+  learnRow.appendChild(el('span', null, 'Learn from what I watch'));
+  const learn = document.createElement('input');
+  learn.type = 'checkbox';
+  learn.checked = !T.off;
+  learn.onchange = () => { T.off = !learn.checked; flushTaste(); };
+  learnRow.appendChild(learn);
+  card.appendChild(learnRow);
+  const resetTaste = el('button', 'editor-btn', 'Reset taste');
+  resetTaste.onclick = () => {
+    if (!confirm('Forget everything the feed has learned about your taste?')) return;
+    taste.reset();
+    renderTaste();
+  };
+  card.appendChild(resetTaste);
 
   card.appendChild(el('div', 'editor-sect', 'Stats'));
   card.appendChild(el('div', null,
@@ -1614,16 +1775,17 @@ function baseSlide(post, typeLabel) {
     `▲ ${fmt(post.ups)} · 💬 ${fmt(post.num_comments)} · u/${post.author}`));
   s.appendChild(overlay);
 
-  const permalink = 'https://www.reddit.com' + post.permalink;
+  // each explicit action teaches once per slide; sound is a global toggle, so it never does
+  s._credited = new Set();
+  s._credit = (k, d) => { if (!s._credited.has(k)) { s._credited.add(k); taste.event(post, d); } };
   const rail = el('div', 'rail');
   rail.appendChild(railButton('↗', 'open', e => {
     e.stopPropagation();
-    window.open(permalink, '_blank');
+    openOnReddit(post, s);
   }));
-  rail.appendChild(railButton('➦', 'share', async e => {
+  rail.appendChild(railButton('⋯', 'more', e => {
     e.stopPropagation();
-    if (navigator.share) { try { await navigator.share({ title: post.title, url: permalink }); } catch {} }
-    else { await navigator.clipboard.writeText(permalink); alert('Link copied'); }
+    openPostSheet(post, s);
   }));
   const saveBtn = railButton(isSaved(post.id) ? '💛' : '🔖', isSaved(post.id) ? 'saved' : 'save', e => {
     e.stopPropagation();
@@ -1633,7 +1795,7 @@ function baseSlide(post, typeLabel) {
   s._saveBtn = saveBtn;
   const dlBtn = railButton('⬇', 'download', e => {
     e.stopPropagation();
-    downloadPost(post, s, dlBtn);
+    downloadPost(post, s, dlBtn).then(ok => { if (ok) s._credit('dl', 2); });
   });
   rail.appendChild(dlBtn);
   s._dlBtn = dlBtn;
@@ -1641,6 +1803,73 @@ function baseSlide(post, typeLabel) {
 
   if (typeLabel) s.appendChild(el('div', 'type-badge', typeLabel));
   return s;
+}
+
+const permalinkOf = post => 'https://www.reddit.com' + post.permalink;
+function openOnReddit(post, s) {
+  window.open(permalinkOf(post), '_blank');
+  s._credit('open', 1);
+}
+async function sharePost(post, s) {
+  const url = permalinkOf(post);
+  try {
+    if (navigator.share) await navigator.share({ title: post.title, url });
+    else { await navigator.clipboard.writeText(url); toast('Link copied'); }
+    s._credit('share', 1.5);
+  } catch {}   // share sheet dismissed, or clipboard refused
+}
+
+// ⋯ on a post. Must run inside the tap: share and window.open need the activation.
+function openPostSheet(post, s) {
+  const name = post.subreddit || '';
+  const sub = name.toLowerCase();
+  const overlay = el('div', 'editor-overlay');
+  const card = el('div', 'editor-card');
+  const close = () => overlay.remove();
+  const head = el('div', 'editor-head');
+  head.appendChild(el('div', 'editor-title', 'r/' + name));
+  const x = el('button', 'editor-btn editor-done editor-done-sm', 'Close');
+  x.onclick = close;
+  head.appendChild(x);
+  card.appendChild(head);
+  const list = el('div', 'editor-list');
+  const action = (label, fn) => {
+    const b = el('button', 'editor-btn sheet-btn', label);
+    b.onclick = () => { close(); fn(); };
+    list.appendChild(b);
+  };
+  if (mode !== 'saved') {   // saved mode never teaches the taste model
+    action('👍 More from r/' + name, () => { taste.event(post, 2); toast('More r/' + name); });
+    action('👎 Less from r/' + name, () => { taste.event(post, -3); toast('Less r/' + name); stepSlide(1); });
+  }
+  if (mode === 'my') action('🚫 Hide r/' + name, () => hideSub(name, s));
+  if (!(mode === 'sub' && currentSub && currentSub.toLowerCase() === sub)) {
+    action('▶ Watch only r/' + name, () => enterSub(name, true));
+  }
+  action('➦ Share', () => sharePost(post, s));
+  action('↗ Open on Reddit', () => openOnReddit(post, s));
+  card.appendChild(list);
+  overlay.appendChild(card);
+  overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+  document.body.appendChild(overlay);
+}
+
+// drops the sub's queued posts and the slides already built ahead of s
+function hideSub(name, s) {
+  const sub = name.toLowerCase();
+  hiddenSubs.add(sub);
+  saveHidden();
+  my.buffer = my.buffer.filter(p => (p.subreddit || '').toLowerCase() !== sub);
+  let ahead = 0;
+  for (let n = s.nextElementSibling; n; ) {
+    const nx = n.nextElementSibling;
+    if (n !== currentSlide && n._sub === sub) { teardownSlide(n); n.remove(); }
+    else ahead++;
+    n = nx;
+  }
+  stepSlide(1);
+  toast('Hidden r/' + name, { action: 'Undo', ms: 4000, onAction: () => { hiddenSubs.delete(sub); saveHidden(); } });
+  if (ahead < 4) loadMore();   // fewer than 3 left once the step lands
 }
 
 function fmt(n) {
@@ -1714,12 +1943,19 @@ function videoSlide(post) {
   // being decoded and correct the badge accordingly
   v.addEventListener('playing', () => {
     s._played = true;   // watched videos become cache candidates on teardown
+    if (s._enter && s._ttff == null) s._ttff = performance.now() - s._enter;
     clearTimeout(s._audChk);
     s._audChk = setTimeout(() => {
       if (v.paused || s._audio || v.webkitAudioDecodedByteCount === undefined) return;
       if (v.webkitAudioDecodedByteCount > 0) setBadge(s, null);          // it has sound
       else setBadge(s, '🔇 no sound in this video');
     }, 1800);
+  });
+
+  // a jump back in time while on screen is the loop wrapping around
+  v.addEventListener('timeupdate', () => {
+    if (s._enter && v.currentTime + 0.5 < s._lastT) s._loops++;
+    s._lastT = v.currentTime;
   });
 
   // first frame of the current slide opens the warm gate for its neighbours
@@ -1902,6 +2138,7 @@ function gallerySlide(post) {
   const badge = s.querySelector('.type-badge');
   car.addEventListener('scroll', () => {
     const i = Math.round(car.scrollLeft / car.clientWidth);
+    s._frames = Math.max(s._frames || 1, i + 1);
     prev.hidden = i === 0;
     next.hidden = i >= urls.length - 1;
     dots.querySelectorAll('span').forEach((d, j) => d.classList.toggle('on', j === i));
@@ -2067,7 +2304,8 @@ function releaseMedia(s, force) {
   v.preload = 'none';
 }
 function teardownSlide(s) {
-  s._dead = true; io.unobserve(s); warmIO.unobserve(s);
+  if (s._enter) logView(s);
+  s._dead = true; io.unobserve(s); warmIO.unobserve(s); engageIO.unobserve(s);
   releaseMedia(s, true); clearTimeout(s._audChk);
   if (s._audio) { s._audio.removeAttribute('src'); s._audio.load(); }
 }
@@ -2087,8 +2325,8 @@ function stashFeed() {
   if (mode !== 'my' || stash || !feed.children.length) return clearFeed();
   const nodes = [...feed.children];
   for (const s of nodes) {
-    if (s._enter && typeof logView === 'function') logView(s);   // logView lands with item 22
-    io.unobserve(s); warmIO.unobserve(s);   // re-observed by the MutationObserver on restore
+    if (s._enter) logView(s);
+    io.unobserve(s); warmIO.unobserve(s); engageIO.unobserve(s);   // re-observed by the MutationObserver on restore
     s._warm = false;
     releaseMedia(s);
   }
@@ -2263,6 +2501,50 @@ const io = new IntersectionObserver(entries => {
   }
 }, { threshold: [0, 0.6] });
 
+// engagement: how long a slide stays on screen and what happened while it did
+const engageIO = new IntersectionObserver(es => {
+  for (const e of es) {
+    const s = e.target;
+    if (s.classList.contains('placeholder')) continue;
+    if (e.isIntersecting && e.intersectionRatio >= 0.6) {
+      if (!s._enter && !s._dead && s.isConnected) {
+        s._enter = performance.now();
+        s._loops = 0;
+        s._lastT = 0;
+        s._ttff = s._loadedOnce ? 0 : null;
+        s._frames = s._frames || 1;
+      }
+    } else if (s._enter) logView(s);
+  }
+}, { threshold: [0, 0.6] });
+
+// Turns one view into a taste signal. Video time only counts from the first
+// frame, and a slow start is skipped: that is the network, not the viewer.
+function logView(s) {
+  const dwell = performance.now() - s._enter;
+  s._enter = 0;
+  const post = s._post;
+  if (!post || mode === 'saved') return;
+  if (dwell < 250) return;   // passed over by a programmatic scroll, not a choice
+  let sig = 0;
+  if (s._video) {
+    if (s._ttff == null || s._ttff > 4000) return;
+    const dur = (s._rv && s._rv.duration) || s._video.duration || 15;
+    const watched = dwell - s._ttff;
+    const frac = watched / 1000 / dur;
+    sig = watched < 1500 ? -1
+      : (s._loops >= 1 || frac >= 0.9) ? 1 + 0.5 * Math.min(s._loops, 3)
+      : Math.max(0, Math.min(frac, 0.9)) * 0.6;
+  } else if (s._kind === 'gallery') {
+    sig = dwell < 800 ? -0.7 : 0.8 * s._frames / (s.querySelectorAll('.frame').length || 1);
+  } else sig = dwell < 800 ? -0.7 : dwell > 4000 ? 0.6 : 0;
+  taste.event(post, sig);
+  if (dwell > 1500) rememberSeen(post.id);
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && currentSlide && currentSlide._enter) logView(currentSlide);
+});
+
 // warm-up: when a slide is within ~2.5 screens of the viewport, start
 // downloading its video so it plays instantly when swiped to; when it
 // drifts far away again, tear the hls instance down to free memory.
@@ -2271,7 +2553,7 @@ const warmIO = new IntersectionObserver(entries => {
     const s = e.target;
     if (s._dead || !s.isConnected) continue;   // incl. placeholders cleared by clearFeed, stashed slides
     if (e.isIntersecting && s.classList.contains('placeholder')) {
-      warmIO.unobserve(s); io.unobserve(s);
+      warmIO.unobserve(s); io.unobserve(s); engageIO.unobserve(s);
       s._dead = true;   // a second record for it in this batch must not build again
       // the fallback is not a placeholder, so a post that no longer builds can't loop
       const ns = s._post && buildSlide(s._post);
@@ -2364,6 +2646,7 @@ new MutationObserver(muts => {
     if (!n.classList) continue;
     io.observe(n);
     warmIO.observe(n);
+    engageIO.observe(n);
   }
 }).observe(feed, { childList: true });
 
