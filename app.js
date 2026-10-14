@@ -940,7 +940,7 @@ function ensureBuffer() {
 async function myLoadMore() {
   if (loading) return;
   loading = true;
-  setBusy(true);
+  if (feed.children.length === 0) setBusy(true);   // background top-ups must not look like a refresh
   const g = gen;
   try {
     const fill = ensureBuffer();
@@ -1094,6 +1094,19 @@ function refresh() {
     subSortIdx = (subSortIdx + 1) % SORTS.length;   // hot → top(day) → rising → top(week)
     enterSub(currentSub, false);
   }
+  // a 429 pause outlives the status that announced it
+  const wait = Math.ceil((queuePausedUntil - Date.now()) / 1000);
+  if (mode !== 'saved' && loading && wait > 0 && feed.children.length === 0) {
+    showStatus(`Reddit rate limit — retrying in ${wait}s…`);
+  }
+}
+// no !loading guard: newBuild() drops the in-flight load, so a refresh always wins
+let lastRefresh = 0;
+function tryRefresh() {
+  const now = Date.now();
+  if (now - lastRefresh < 600) return;
+  lastRefresh = now;
+  refresh();
 }
 
 function loadMore() {
@@ -1123,13 +1136,20 @@ function rebuildTopbar() {
   rf.id = 'refresh-chip';
   rf.title = 'Refresh — new mix';
   rf.setAttribute('aria-label', 'Refresh feed');
-  rf.classList.toggle('busy', loading && mode === 'my');
-  rf.onclick = () => { if (!loading) refresh(); };
+  rf.classList.toggle('busy', loading && mode === 'my' && feed.children.length === 0);
+  rf.onclick = tryRefresh;
   topbar.appendChild(rf);
 
   const wrap = el('div', null);
   wrap.id = 'chipwrap';
   const strip = el('div', 'chips');
+  // a plain mouse wheel only scrolls vertically, and this strip only overflows sideways
+  strip.addEventListener('wheel', e => {
+    if (Math.abs(e.deltaY) > Math.abs(e.deltaX) && strip.scrollWidth > strip.clientWidth) {
+      strip.scrollLeft += e.deltaY;
+      e.preventDefault();
+    }
+  }, { passive: false });
   wrap.appendChild(strip);
   topbar.appendChild(wrap);
 
@@ -1190,15 +1210,19 @@ function fold(label, className) {
 }
 
 function openEditor() {
+  if (document.querySelector('.editor-overlay')) return;
   const overlay = el('div', 'editor-overlay');
   const card = el('div', 'editor-card');
-  // closing without changes must not rebuild (and refetch) the feed
-  const snap = () => JSON.stringify({ feeds, activeFeed, showNsfw });
-  const before = snap();
+  // closing without changes to the watched feed must not rebuild (and refetch) it;
+  // feed objects are edited in place, so identity catches a delete or a switch
+  const feed0 = feeds[activeFeed];
+  const feedSnap = () => JSON.stringify(feeds[activeFeed]);
+  const feedBefore = feedSnap();
+  const nsfwBefore = showNsfw;
   const hiddenBefore = hiddenSubs.size;
   const done = el('button', 'editor-btn editor-done editor-done-sm', 'Done');
-  const onKey = e => { if (e.key === 'Escape') done.onclick(); };
-  const close = () => { document.removeEventListener('keydown', onKey); overlay.remove(); };
+  let back = null;
+  const close = () => overlay.remove();
 
   const head = el('div', 'editor-head');
   head.appendChild(el('div', 'editor-title', `Feeds — v${APP_VERSION}`));
@@ -1208,6 +1232,13 @@ function openEditor() {
   /* ----- your feeds: switch, create, delete ----- */
   const feedList = el('div', 'editor-list');
   const subsTitle = el('div', 'editor-sect');
+  // declared before renderFeeds, whose first run precedes the preset loop
+  const presetBtns = [];
+  const paintPresets = () => presetBtns.forEach(([b, p]) => {
+    const have = feeds.some(f => f.name === p.name);
+    b.textContent = (have ? '✓ ' : '') + p.name;
+    b.classList.toggle('preset-have', have);
+  });
   const renderFeeds = () => {
     feedList.replaceChildren();
     feeds.forEach((f, i) => {
@@ -1242,6 +1273,7 @@ function openEditor() {
       feedList.appendChild(row);
     });
     subsTitle.textContent = 'Subreddits in ' + feeds[activeFeed].name;
+    paintPresets();
   };
   card.appendChild(feedList);
 
@@ -1323,9 +1355,8 @@ function openEditor() {
   const sfwGrid = el('div', 'preset-grid');
   const nsfwGrid = el('div', 'preset-grid');
   for (const preset of PRESET_FEEDS) {
-    const existing = feeds.findIndex(f => f.name === preset.name);
-    const b = el('button', 'editor-btn' + (existing !== -1 ? ' preset-have' : ''),
-      (existing !== -1 ? '✓ ' : '') + preset.name);
+    const b = el('button', 'editor-btn');
+    presetBtns.push([b, preset]);
     b.onclick = () => {
       // ask before touching feeds: a cancelled tap must leave nothing behind
       if (preset.nsfw && !showNsfw) {
@@ -1346,6 +1377,7 @@ function openEditor() {
     };
     (preset.nsfw ? nsfwGrid : sfwGrid).appendChild(b);
   }
+  paintPresets();
   smart.appendChild(sfwGrid);
   const adult = fold('18+ presets');
   adult.appendChild(nsfwGrid);
@@ -1463,7 +1495,14 @@ function openEditor() {
       if (j !== -1) { activeFeed = j; subs = feeds[j].subs; saveSubs(); }
     }
     close();
-    const changed = snap() !== before;
+    if (back?.isConnected) back.focus({ preventScroll: true });
+    const feedChanged = feeds[activeFeed] !== feed0 || feedSnap() !== feedBefore;
+    const changed = feedChanged || showNsfw !== nsfwBefore;
+    // only 18+ flipped: stay in Saved / r/sub instead of falling back to the mix
+    if (changed && !feedChanged && (mode === 'saved' || mode === 'sub')) {
+      dropStash();   // the parked mix was built under the old 18+ setting
+      return mode === 'saved' ? enterSavedFeed(currentSlide?._post?.id) : enterSub(currentSub, false);
+    }
     if (changed && subs.length === 0) {
       newBuild();    // an in-flight load of the old feed must not render behind the status
       dropStash();
@@ -1482,8 +1521,9 @@ function openEditor() {
 
   overlay.appendChild(card);
   overlay.addEventListener('click', e => { if (e.target === overlay) done.onclick(); });
-  document.addEventListener('keydown', onKey);
   document.body.appendChild(overlay);
+  back = document.activeElement;
+  done.focus({ preventScroll: true });
 }
 
 /* =======================================================================
@@ -1585,9 +1625,11 @@ function enterSavedFeed(startId) {
 function removeModePill() { document.getElementById('mode-pill')?.remove(); }
 
 function openProfile() {
+  if (document.querySelector('.editor-overlay')) return;
   const overlay = el('div', 'editor-overlay');
   const card = el('div', 'editor-card');
-  const close = () => overlay.remove();
+  let back = null;
+  const close = () => { overlay.remove(); if (back?.isConnected) back.focus({ preventScroll: true }); };
   const head = el('div', 'editor-head');
   head.appendChild(el('div', 'editor-title', '👤 Profile'));
   const done = el('button', 'editor-btn editor-done editor-done-sm', 'Close');
@@ -1686,6 +1728,8 @@ function openProfile() {
   overlay.appendChild(card);
   overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
   document.body.appendChild(overlay);
+  back = document.activeElement;
+  done.focus({ preventScroll: true });
 }
 
 /* =======================================================================
@@ -1872,9 +1916,12 @@ async function sharePost(post, s) {
 function openPostSheet(post, s) {
   const name = post.subreddit || '';
   const sub = name.toLowerCase();
+  if (document.querySelector('.editor-overlay')) return;
   const overlay = el('div', 'editor-overlay');
   const card = el('div', 'editor-card');
-  const close = () => overlay.remove();
+  // preventScroll: refocusing ⋯ on an off-screen slide would scroll the feed back to it
+  let back = null;
+  const close = () => { overlay.remove(); if (back?.isConnected) back.focus({ preventScroll: true }); };
   const head = el('div', 'editor-head');
   head.appendChild(el('div', 'editor-title', 'r/' + name));
   const x = el('button', 'editor-btn editor-done editor-done-sm', 'Close');
@@ -1884,7 +1931,7 @@ function openPostSheet(post, s) {
   const list = el('div', 'editor-list');
   const action = (label, fn) => {
     const b = el('button', 'editor-btn sheet-btn', label);
-    b.onclick = () => { close(); fn(); };
+    b.onclick = () => { overlay.remove(); fn(); };   // fn may navigate away: no refocus
     list.appendChild(b);
   };
   if (mode !== 'saved') {   // saved mode never teaches the taste model
@@ -1901,6 +1948,8 @@ function openPostSheet(post, s) {
   overlay.appendChild(card);
   overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
   document.body.appendChild(overlay);
+  back = document.activeElement;
+  x.focus({ preventScroll: true });
 }
 
 // drops the sub's queued posts and the slides already built ahead of s
@@ -2749,27 +2798,46 @@ function stepSlide(dir) {
   const t = cur && (dir > 0 ? cur.nextElementSibling : cur.previousElementSibling);
   if (t) feed.scrollTo({ top: t.offsetTop, behavior: 'smooth' });
 }
+// a mouse or touch click must not leave a button focused (detail is 0 for Enter/Space),
+// so a focused button below always means keyboard focus
+document.addEventListener('click', e => {
+  if (e.detail && document.activeElement instanceof HTMLButtonElement) document.activeElement.blur();
+}, true);
 document.addEventListener('keydown', e => {
   if (e.metaKey || e.ctrlKey || e.altKey) return;
   const t = e.target;
-  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+  // before the input check: Escape must close an overlay from its own checkboxes and fields
   const ov = document.querySelector('.editor-overlay');
   if (ov) {
-    // both overlays close on a click whose target is the backdrop itself
-    if (e.key === 'Escape') { e.preventDefault(); ov.click(); }
+    // every overlay closes on a click whose target is the backdrop itself
+    if (e.key === 'Escape') { e.preventDefault(); ov.click(); return; }
+    // keys aimed at the page behind must not re-fire its buttons
+    if (!ov.contains(t) && (e.key === 'Enter' || e.key === ' ')) e.preventDefault();
+    if (e.key === 'Tab') {
+      const f = [...ov.querySelectorAll('button, input, summary, [tabindex="0"]')].filter(x => x.getClientRects().length);
+      const first = f[0], last = f[f.length - 1];
+      if (first && (!ov.contains(t) || t === (e.shiftKey ? first : last))) {
+        e.preventDefault();
+        (e.shiftKey ? last : first).focus();
+      }
+    }
     return;
   }
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
   const cur = currentSlide;
   const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
   switch (k) {
     case 'ArrowDown': case 'j': case 'PageDown': if (!e.repeat) stepSlide(1); break;
     case 'ArrowUp': case 'k': case 'PageUp': if (!e.repeat) stepSlide(-1); break;
     // toggles ignore auto-repeat: a held key must not flip save or queue downloads
-    case ' ': if (!e.repeat && cur?._video) cur.click(); break;
+    case ' ':
+      if (document.activeElement instanceof HTMLButtonElement) return;   // keyboard focus: native activation
+      if (!e.repeat && cur?._video) cur.click();
+      break;
     case 'm': if (!e.repeat) toggleSound(); break;
     case 's': if (!e.repeat) cur?._saveBtn?.click(); break;
     case 'd': if (!e.repeat) cur?._dlBtn?.click(); break;
-    case 'r': if (!e.repeat && !loading) refresh(); break;
+    case 'r': if (!e.repeat) tryRefresh(); break;
     case 'ArrowLeft': case 'ArrowRight': {
       const car = cur?.querySelector('.carousel');
       if (car) pageCarousel(car, k === 'ArrowRight' ? 1 : -1);

@@ -313,14 +313,19 @@
     background: rgba(20,20,24,.92);
     color: #fff;
     padding: 10px 14px;
-    border-radius: 999px;
+    border-radius: 18px;   /* 999px looks odd once the toast wraps to two lines */
     font-size: 14px;
     display: flex;
-    gap: 12px;
+    flex-wrap: wrap;
+    justify-content: center;
+    text-align: center;
+    gap: 4px 12px;
     align-items: center;
-    max-width: 90vw;
+    max-width: calc(var(--col) - 148px);   /* clear the 74px rail gutter on both sides */
   }
+  .toast span { overflow-wrap: anywhere; }
   .toast button {
+    white-space: nowrap;
     background: none;
     border: 0;
     color: #ffd7a8;
