@@ -1126,10 +1126,15 @@ function downloadTargetOf(post, s) {
   return null;
 }
 async function downloadPost(post, s, btn) {
-  const t = downloadTargetOf(post, s);
-  if (!t) return alert('Nothing downloadable on this post');
   const icon = btn && btn.querySelector('.icon');
   if (icon) icon.textContent = '⏳';
+  // redgifs resolve lazily — wait for the original rather than take the video-only rehost
+  const rg = s && s._rgId && !s._mp4Url ? await resolveRedgifs(s._rgId) : null;
+  const t = rg ? { url: rg, ext: '.mp4' } : downloadTargetOf(post, s);
+  if (!t) {
+    if (icon) icon.textContent = '⬇';
+    return alert('Nothing downloadable on this post');
+  }
   try {
     const res = await fetch(t.url);
     if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -1547,7 +1552,8 @@ function toggleSound() {
 function posterOf(post) {
   try { return post.preview.images[0].source.url; } catch { return null; }
 }
-const TARGET_W = Math.min(1080, Math.ceil(innerWidth * (devicePixelRatio || 1)));
+// innerWidth can read 0 in a tab that hasn't been laid out yet
+const TARGET_W = Math.min(1080, Math.ceil(innerWidth * (devicePixelRatio || 1)) || 1080);
 // smallest preview rendition at least minW wide
 function sizedPreview(post, minW = TARGET_W) {
   const img = post.preview && post.preview.images && post.preview.images[0];
@@ -1604,6 +1610,7 @@ function gallerySlide(post) {
     const i = Math.round(car.scrollLeft / car.clientWidth);
     dots.querySelectorAll('span').forEach((d, j) => d.classList.toggle('on', j === i));
     if (badge) badge.textContent = `📷 ${i + 1}/${urls.length}` + (i + 1 < urls.length ? ' — swipe →' : '');
+    s._bdSet = true;   // warmIO must not reset it to the first frame
     bd.style.backgroundImage = `url("${bdUrls[Math.min(i, bdUrls.length - 1)]}")`;
   }, { passive: true });
 
@@ -1733,11 +1740,16 @@ function armRedgifs(s) {
       s._hlsUrl = rv.hls_url;
       s._fallbackUrl = rv.fallback_url;
       if (live) attachHls(s);
-    } else if (rv.fallback_url) armMp4(s, rv.fallback_url);
-    else { setBadge(s, '⚠️ video unavailable'); return; }
+      // io sized liveHls before this instance existed
+      if (s._hls && s === currentSlide) s._hls.config.maxBufferLength = FULL_BUFFER_S;
+    } else if (rv.fallback_url) {
+      armMp4(s, rv.fallback_url);
+      // io's play() already fired 'play' before armMp4 hooked the side audio
+      if (s._audio && soundOn && !s._video.paused) s._audio.play().catch(() => {});
+    } else { setBadge(s, '⚠️ video unavailable'); return; }
     setBadge(s, '🔇 original unavailable');
     if (isCentered(s)) s._video.play().catch(() => {});
-  }).finally(() => { s._rgPending = false; });
+  }).catch(() => {}).finally(() => { s._rgPending = false; });
 }
 
 // Waterfall prefetch: once the CURRENT video is comfortably buffered, spend
