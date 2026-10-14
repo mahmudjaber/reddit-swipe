@@ -255,16 +255,11 @@ async function pumpQueue() {
       const wait = Math.min(parseInt(res.headers.get('retry-after'), 10) || 15, 60);
       if (job.timer) job.timer.done();
       job.retried = true;
-      if (job.url.startsWith('https://api.redgifs.com/')) {
-        // redgifs' limit is its own — it must not pause reddit listings
-        setTimeout(() => { fetchQueue.push(job); pumpQueue(); }, wait * 1000);
-      } else {
-        queuePausedUntil = Date.now() + wait * 1000;   // global pause: the limit is per client
-        if (feed.children.length === 0 && !(job.stale && job.stale())) {
-          showStatus(`Reddit rate limit — retrying in ${wait}s…`);
-        }
-        fetchQueue.unshift(job);
+      queuePausedUntil = Date.now() + wait * 1000;   // global pause: the limit is per client
+      if (feed.children.length === 0 && !(job.stale && job.stale())) {
+        showStatus(`Reddit rate limit — retrying in ${wait}s…`);
       }
+      fetchQueue.unshift(job);
     } else job.resolve(res);
   } catch (e) {
     job.reject(e);
@@ -521,36 +516,47 @@ function usablePosts(data, skipShown) {
 }
 
 /* ---------- redgifs original resolution (extension only — needs host perm) ---------- */
-let rgToken = null;
-const rgCache = new Map();
-async function resolveRedgifs(id) {
+// direct fetches, not politeFetch: redgifs' limits are its own and must not
+// queue behind (or pause) reddit listings
+let rgTokenP = null;                 // one shared token request
+const rgCache = new Map();           // id -> Promise<url|null>; failures are dropped so they can retry
+async function rgFetch(url, opts = {}) {
+  const to = withTimeout(10000);
+  to.start();
+  try {
+    const r = await fetch(url, { ...opts, signal: to.signal });
+    const j = r.ok ? await r.json() : null;
+    return { status: r.status, ok: r.ok, j };
+  } finally {
+    to.done();
+  }
+}
+function getRgToken() {
+  return rgTokenP ||= rgFetch('https://api.redgifs.com/v2/auth/temporary').then(r => {
+    if (!r.ok || !r.j || !r.j.token) throw new Error('rg auth ' + r.status);
+    return r.j.token;
+  }).catch(e => { rgTokenP = null; throw e; });
+}
+function resolveRedgifs(id) {
   if (rgCache.has(id)) return rgCache.get(id);
-  for (let attempt = 0; attempt < 2; attempt++) {
-    // these share the listing queue — a stalled one must not hold a slot forever
-    const to = withTimeout(15000);
-    try {
-      if (!rgToken) {
-        const r = await politeFetch('https://api.redgifs.com/v2/auth/temporary', { signal: to.signal }, to);
-        rgToken = (await r.json()).token;
-      }
-      const r = await politeFetch('https://api.redgifs.com/v2/gifs/' + encodeURIComponent(id), {
-        headers: { Authorization: 'Bearer ' + rgToken },
-        signal: to.signal,
-      }, to);
-      if (r.status === 401) { rgToken = null; continue; }   // token expired — retry once
-      if (!r.ok) break;
-      const j = await r.json();
+  const p = (async () => {
+    for (let a = 0; a < 2; a++) {
+      const tp = getRgToken();
+      const tok = await tp;
+      const r = await rgFetch('https://api.redgifs.com/v2/gifs/' + encodeURIComponent(id), {
+        headers: { Authorization: 'Bearer ' + tok },
+      });
+      if (r.status === 401) { if (rgTokenP === tp) rgTokenP = null; continue; }   // expired — retry once
+      if (!r.ok) return null;
       // SD first: on a swipe feed, time-to-first-frame beats resolution — HD
       // files run 10-30MB and crawl on weak connections
-      const url = (j && j.gif && j.gif.urls && (j.gif.urls.sd || j.gif.urls.hd)) || null;
-      rgCache.set(id, url);
-      return url;
-    } finally {
-      to.done();
+      return (r.j && r.j.gif && r.j.gif.urls && (r.j.gif.urls.sd || r.j.gif.urls.hd)) || null;
     }
-  }
-  rgCache.set(id, null);
-  return null;
+    return null;
+  })().catch(() => null);
+  rgCache.set(id, p);
+  p.then(u => { if (u === null) rgCache.delete(id); });
+  return p;
 }
 
 /* =======================================================================
@@ -1185,7 +1191,7 @@ function openProfile() {
       const c = el('div', 'saved-card');
       const img = document.createElement('img');
       img.loading = 'lazy';
-      img.src = posterOf(p) || '';
+      img.src = sizedPreview(p, 216) || posterOf(p) || '';
       c.appendChild(img);
       const info = el('div', 'saved-info');
       info.appendChild(el('div', 'saved-title', p.title));
@@ -1393,11 +1399,18 @@ function videoSlide(post) {
   // preload nothing by default — the warm-up observer upgrades the current and
   // next few slides to preload=auto so they don't all fight for bandwidth.
   v.preload = 'none';
-  v.poster = posterOf(post) || '';
+  s._poster = sizedPreview(post, 640) || posterOf(post);   // set by warmIO in range
 
   media.appendChild(v);
   s.prepend(media);
   s._video = v;
+  const bdu = innerWidth > 700 && sizedPreview(post, 108);   // desktop letterbox only
+  if (bdu) {
+    const bd = el('div', 'backdrop');
+    s._bdEl = bd;
+    s._bd = bdu;
+    s.prepend(bd);
+  }
 
   // Safari plays HLS natively (with sound); everywhere else use the mp4
   // fallback (video-only) plus a synced <audio> element for sound.
@@ -1406,17 +1419,9 @@ function videoSlide(post) {
   // carries the audio whenever the source has any.
   if (post._redgifs && EXTENSION) {
     // reddit's rehost of redgifs is video-only — fetch the original, which
-    // is a plain mp4 with the audio muxed in
+    // is a plain mp4 with the audio muxed in. Resolved lazily by armRedgifs.
     s._path = 'redgifs';
-    resolveRedgifs(post._redgifs).then(url => {
-      if (!url || s._dead) return;
-      s._mp4Url = url;
-      if (!s._warm) return;   // out of range: warmIO arms it on approach
-      return setMp4Src(s, v, url).then(() => {
-        const r = s.getBoundingClientRect();
-        if (r.top < innerHeight * 0.5 && r.bottom > innerHeight * 0.5) v.play().catch(() => {});
-      });
-    }).catch(() => {});
+    s._rgId = post._redgifs;
   } else if (IS_SAFARI && rv.hls_url) {
     s._path = 'native-hls';
     s._src = rv.hls_url;
@@ -1542,19 +1547,28 @@ function toggleSound() {
 function posterOf(post) {
   try { return post.preview.images[0].source.url; } catch { return null; }
 }
+const TARGET_W = Math.min(1080, Math.ceil(innerWidth * (devicePixelRatio || 1)));
+// smallest preview rendition at least minW wide
+function sizedPreview(post, minW = TARGET_W) {
+  const img = post.preview && post.preview.images && post.preview.images[0];
+  if (!img) return null;
+  const r = (img.resolutions || []).find(r => r.width >= minW) || img.source;   // fall back UP, never down
+  return (r && r.url) || null;
+}
 
 /* ----- gallery → horizontal carousel ----- */
 function gallerySlide(post) {
   const items = (post.gallery_data && post.gallery_data.items) || [];
-  const urls = items
-    .map(it => {
-      const m = post.media_metadata[it.media_id];
-      if (!m || m.status !== 'valid') return null;
-      if (m.s && m.s.u) return m.s.u;
-      if (m.s && m.s.gif) return m.s.gif;
-      return null;
-    })
-    .filter(Boolean);
+  const urls = [], bdUrls = [];
+  for (const it of items) {
+    const m = post.media_metadata[it.media_id];
+    if (!m || m.status !== 'valid' || !m.s) continue;
+    const anim = (m.e === 'AnimatedImage' || !m.s.u) && m.s.gif;
+    const frame = anim ? m.s.gif : (((m.p || []).find(r => r.x >= TARGET_W)) || m.s).u;
+    if (!frame) continue;
+    urls.push(frame);
+    bdUrls.push((m.p && m.p[0] && m.p[0].u) || frame);
+  }
   if (urls.length === 0) return null;
 
   const s = baseSlide(post, `📷 1/${urls.length} — swipe →`);
@@ -1573,7 +1587,8 @@ function gallerySlide(post) {
   s.prepend(media);
 
   const bd = el('div', 'backdrop');
-  bd.style.backgroundImage = `url("${urls[0]}")`;
+  s._bdEl = bd;
+  s._bd = bdUrls[0];   // set by warmIO in range
   s.prepend(bd);
 
   const dots = el('div', 'dots');
@@ -1589,7 +1604,7 @@ function gallerySlide(post) {
     const i = Math.round(car.scrollLeft / car.clientWidth);
     dots.querySelectorAll('span').forEach((d, j) => d.classList.toggle('on', j === i));
     if (badge) badge.textContent = `📷 ${i + 1}/${urls.length}` + (i + 1 < urls.length ? ' — swipe →' : '');
-    bd.style.backgroundImage = `url("${urls[Math.min(i, urls.length - 1)]}")`;
+    bd.style.backgroundImage = `url("${bdUrls[Math.min(i, bdUrls.length - 1)]}")`;
   }, { passive: true });
 
   return s;
@@ -1607,12 +1622,14 @@ function imageSlide(post) {
   const img = document.createElement('img');
   img.className = 'single';
   img.loading = 'lazy';
-  img.src = url;
+  const src = /\.gif$/i.test(url) ? url : (sizedPreview(post) || url);   // a preview of a gif is a still
+  img.src = src;
   media.appendChild(img);
   s.prepend(media);
 
   const bd = el('div', 'backdrop');
-  bd.style.backgroundImage = `url("${url}")`;
+  s._bdEl = bd;
+  s._bd = sizedPreview(post, 108) || src;   // set by warmIO in range
   s.prepend(bd);
   return s;
 }
@@ -1685,7 +1702,42 @@ function clearFeed() {
 }
 function onBecameCurrent(s) {
   currentSlide = s;
+  armRedgifs(s);
   // later items append here
+}
+
+function isCentered(s) {
+  const r = s.getBoundingClientRect();
+  return r.top < innerHeight * 0.5 && r.bottom > innerHeight * 0.5;
+}
+// redgifs resolve only once a slide is near; when the original can't be had,
+// fall back to reddit's own (video-only) rehost instead of a frozen poster
+function armRedgifs(s) {
+  if (!s._rgId || s._mp4Url || s._rgPending || s._rgDone) return;
+  s._rgPending = true;
+  const rv = s._rv || {};
+  resolveRedgifs(s._rgId).then(url => {
+    if (s._dead) return;
+    s._rgDone = true;
+    const live = s._warm || s === currentSlide;   // out of range: warmIO arms it on approach
+    if (url) {
+      if (!live) { s._mp4Url = url; return; }
+      return setMp4Src(s, s._video, url).then(() => { if (isCentered(s)) s._video.play().catch(() => {}); });
+    }
+    if (IS_SAFARI && rv.hls_url) {
+      s._path = 'native-hls(rg-fallback)';
+      s._src = rv.hls_url;
+      if (live) s._video.src = rv.hls_url;
+    } else if (rv.hls_url && window.Hls && Hls.isSupported()) {
+      s._path = 'hls.js(rg-fallback)';
+      s._hlsUrl = rv.hls_url;
+      s._fallbackUrl = rv.fallback_url;
+      if (live) attachHls(s);
+    } else if (rv.fallback_url) armMp4(s, rv.fallback_url);
+    else { setBadge(s, '⚠️ video unavailable'); return; }
+    setBadge(s, '🔇 original unavailable');
+    if (isCentered(s)) s._video.play().catch(() => {});
+  }).finally(() => { s._rgPending = false; });
 }
 
 // Waterfall prefetch: once the CURRENT video is comfortably buffered, spend
@@ -1695,6 +1747,7 @@ function promoteNextSlide(s) {
   let next = s.nextElementSibling;
   while (next && !next._video) next = next.nextElementSibling;   // skip stills
   if (!next) return;
+  armRedgifs(next);
   if (next._hlsUrl) {
     attachHls(next);
     if (next._hls && next._hls.config.maxBufferLength < 15) {
@@ -1745,10 +1798,17 @@ const io = new IntersectionObserver(entries => {
 const warmIO = new IntersectionObserver(entries => {
   for (const e of entries) {
     const s = e.target;
+    if (s._dead) continue;
+    // posters and blurred backdrops load only once a slide is in warm range
+    if (e.isIntersecting) {
+      if (s._bd && s._bdEl && !s._bdSet) { s._bdSet = true; s._bdEl.style.backgroundImage = `url("${s._bd}")`; }
+      if (s._poster && s._video && !s._video.getAttribute('poster')) s._video.poster = s._poster;
+    }
     const v = s._video;
-    if (!v || s._dead) continue;
+    if (!v) continue;
     s._warm = e.isIntersecting;
     if (e.isIntersecting) {
+      armRedgifs(s);
       if (s._hlsUrl) {
         attachHls(s);
       } else {
