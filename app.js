@@ -130,6 +130,9 @@ function toggleSave(post, btn) {
   else {
     savedPosts.unshift(slimPost(post));
     if (savedPosts.length > SAVED_MAX) savedPosts.pop();
+    // the on-screen slide is queued by warmIO once it leaves the screen
+    const sl = [...feed.children].find(x => x._post && x._post.id === post.id);
+    if (sl && sl._mp4Url && sl !== currentSlide) queueMp4Cache(sl._mp4Url);
   }
   persistSaved();
   if (btn) {
@@ -328,9 +331,10 @@ async function fetchSubPage(sub, sort, t, cursor, stale) {
    -----------------------------------------------------------------------
    HLS: every segment the player downloads is written through, so rewatches
    and revisits are served from disk at zero extra bandwidth. mp4/redgifs:
-   cached in the background only AFTER the video leaves the screen (never
-   competes with the playing video). v.redd.it URLs carry expiring auth
-   tokens in the query string, so cache keys are the bare path.
+   only SAVED posts are cached, in the background once the video is off
+   screen, and the download is aborted on every swipe so it never competes
+   with the video being watched. v.redd.it URLs carry expiring auth tokens
+   in the query string, so cache keys are the bare path.
    ======================================================================= */
 const VIDCACHE = 'rs-video-cache-v1';
 const VID_CACHE_CAP = 512 * 1024 * 1024;   // evict oldest videos past this
@@ -340,6 +344,12 @@ const CACHE_OK = typeof caches !== 'undefined';
 let vidIndex = {};                          // videoId -> { at, bytes }
 try { vidIndex = JSON.parse(localStorage.getItem('rs.vidcache')) || {}; } catch {}
 const saveVidIndex = () => { try { localStorage.setItem('rs.vidcache', JSON.stringify(vidIndex)); } catch {} };
+// LRU touches happen per fragment — batch them; size changes still save at once
+let vidSaveT = 0;
+const saveVidIndexSoon = () => { if (!vidSaveT) vidSaveT = setTimeout(() => { vidSaveT = 0; saveVidIndex(); }, 2000); };
+const flushVidIndex = () => { if (vidSaveT) { clearTimeout(vidSaveT); vidSaveT = 0; } saveVidIndex(); };
+addEventListener('pagehide', flushVidIndex);
+document.addEventListener('visibilitychange', () => { if (document.hidden) flushVidIndex(); });
 
 function cacheKeyOf(url) {
   try {
@@ -364,59 +374,83 @@ function bumpVidIndex(id, addBytes) {
   const e = vidIndex[id] || (vidIndex[id] = { at: 0, bytes: 0 });
   e.at = Date.now();
   e.bytes += addBytes;
-  saveVidIndex();
+  addBytes > 0 ? saveVidIndex() : saveVidIndexSoon();
   if (addBytes > 0) evictVidCache();
 }
+// one run at a time: overlapping runs each subtract from a stale total
+let evicting = false;
 async function evictVidCache() {
-  let total = cacheTotalBytes();
-  if (total <= VID_CACHE_CAP) return;
-  const cache = await caches.open(VIDCACHE);
-  const keys = await cache.keys();
-  const oldest = Object.keys(vidIndex).sort((a, b) => vidIndex[a].at - vidIndex[b].at);
-  for (const id of oldest) {
-    if (total <= VID_CACHE_CAP * 0.8) break;   // free a chunk, not one file at a time
-    for (const req of keys) if (vidIdOf(req.url) === id) cache.delete(req);
-    total -= vidIndex[id].bytes;
-    delete vidIndex[id];
+  if (evicting || cacheTotalBytes() <= VID_CACHE_CAP) return;
+  evicting = true;
+  try {
+    const cache = await caches.open(VIDCACHE);
+    const byId = new Map();
+    for (const req of await cache.keys()) {
+      const id = vidIdOf(req.url);
+      if (!byId.has(id)) byId.set(id, []);
+      byId.get(id).push(req);
+    }
+    let total = cacheTotalBytes();   // writes may have landed during the awaits
+    const oldest = Object.keys(vidIndex).sort((a, b) => vidIndex[a].at - vidIndex[b].at);
+    for (const id of oldest) {
+      if (total <= VID_CACHE_CAP * 0.8) break;   // free a chunk, not one file at a time
+      for (const req of byId.get(id) || []) cache.delete(req);
+      total -= vidIndex[id].bytes || 0;
+      delete vidIndex[id];
+    }
+    saveVidIndex();
+  } catch {} finally {
+    evicting = false;
   }
-  saveVidIndex();
 }
 
 // hls.js fragment loader with cache-first reads and write-through on miss
 function makeCacheFragLoader() {
   return class extends Hls.DefaultConfig.loader {
+    // an abort can land while the cache lookup is still pending
+    abort() { this._cacheCancelled = true; super.abort(); }
+    destroy() { this._cacheCancelled = true; super.destroy(); }
     load(context, config, callbacks) {
       if (!CACHE_OK || context.responseType !== 'arraybuffer') {
         return super.load(context, config, callbacks);
       }
+      this._cacheCancelled = false;
       // CMAF fragments are byte ranges within one file — the range MUST be
       // part of the key or fragments would overwrite each other
       const range = context.rangeStart != null ? `?r=${context.rangeStart}-${context.rangeEnd ?? ''}` : '';
       const key = cacheKeyOf(context.url) + range;
-      caches.open(VIDCACHE).then(c => c.match(key)).then(hit => {
-        if (!hit) {
-          const orig = callbacks.onSuccess;
-          callbacks.onSuccess = (response, stats, ctx, xhr) => {
-            if (response.data && response.data.byteLength) {
-              const copy = response.data.slice(0);
-              caches.open(VIDCACHE)
-                .then(c => c.put(key, new Response(copy)))
-                .then(() => bumpVidIndex(vidIdOf(context.url), copy.byteLength))
-                .catch(() => {});
-            }
-            orig(response, stats, ctx, xhr);
-          };
-          return super.load(context, config, callbacks);
-        }
-        hit.arrayBuffer().then(data => {
-          bumpVidIndex(vidIdOf(context.url), 0);   // touch LRU, no size change
-          const now = performance.now();
-          const stats = this.stats;
-          stats.loading.start = stats.loading.first = stats.loading.end = now;
-          stats.loaded = stats.total = data.byteLength;
-          callbacks.onSuccess({ url: context.url, data }, stats, context, null);
-        });
-      }).catch(() => super.load(context, config, callbacks));
+      const id = vidIdOf(context.url);
+      let netStarted = false;
+      const net = () => {
+        if (this._cacheCancelled || netStarted) return;
+        netStarted = true;
+        super.load(context, config, { ...callbacks, onSuccess: (response, stats, ctx, xhr) => {
+          if (response.data && response.data.byteLength) {
+            const copy = response.data.slice(0);
+            caches.open(VIDCACHE)
+              .then(c => c.put(key, new Response(copy)))
+              .then(() => bumpVidIndex(id, copy.byteLength))
+              .catch(() => {});
+          }
+          callbacks.onSuccess(response, stats, ctx, xhr);
+        } });
+      };
+      if (!vidIndex[id]) return net();   // never cached: skip the lookup
+      caches.open(VIDCACHE).then(c => c.match(key)).then(hit => hit ? hit.arrayBuffer() : null).then(data => {
+        if (this._cacheCancelled) return;
+        if (!data) return net();
+        bumpVidIndex(id, 0);   // touch LRU, no size change
+        // report a transfer at the learned network speed — instant hits would
+        // read as ~80 Mbps and push ABR to levels the network can't sustain
+        const now = performance.now(), st = this.stats, ttfb = 80;
+        const xfer = Math.max(50, data.byteLength * 8 / netBwBps * 1000);
+        st.loading.start = now - ttfb - xfer;
+        st.loading.first = st.loading.start + ttfb;
+        st.loading.end = now;
+        st.loaded = st.total = data.byteLength;
+        st._fromCache = true;
+        queueMicrotask(() => callbacks.onSuccess({ url: context.url, data }, st, context, null));
+      }).catch(net);
     }
   };
 }
@@ -447,34 +481,47 @@ async function setMp4Src(s, v, url) {
   v.src = url;
 }
 
-// background write-through queue — one at a time, only videos actually watched
+// background write-through queue — one at a time, saved posts only;
+// onBecameCurrent aborts the download in flight and it retries later
 const mp4CacheQueue = [];
 let mp4Caching = false;
+let mp4Ctl = null;
 function queueMp4Cache(url) {
   if (!CACHE_OK || mp4CacheQueue.includes(url)) return;
   mp4CacheQueue.push(url);
+  if (mp4CacheQueue.length > 5) mp4CacheQueue.shift();
   pumpMp4Cache();
 }
 async function pumpMp4Cache() {
   if (mp4Caching || mp4CacheQueue.length === 0) return;
   mp4Caching = true;
   const url = mp4CacheQueue.shift();
+  let timedOut = false, t = 0;
   try {
     const cache = await caches.open(VIDCACHE);
     if (!await cache.match(cacheKeyOf(url))) {
-      const res = await fetch(url);
+      const ctl = mp4Ctl = new AbortController();
+      t = setTimeout(() => { timedOut = true; ctl.abort(); }, 30000);
+      const res = await fetch(url, { signal: ctl.signal, priority: 'low' });
       const len = +res.headers.get('content-length') || 0;
       if (res.ok && (!len || len < MP4_CACHE_MAX)) {
         const buf = await res.arrayBuffer();
+        clearTimeout(t);
         if (buf.byteLength < MP4_CACHE_MAX) {
           await cache.put(cacheKeyOf(url), new Response(buf));
           bumpVidIndex(vidIdOf(url), buf.byteLength);
         }
       }
     }
-  } catch {}
+  } catch (e) {
+    // aborted by a swipe: try again later; a timeout means the link is too slow
+    if (e && e.name === 'AbortError' && !timedOut && !mp4CacheQueue.includes(url)) mp4CacheQueue.unshift(url);
+  } finally {
+    clearTimeout(t);
+  }
+  mp4Ctl = null;
   mp4Caching = false;
-  setTimeout(pumpMp4Cache, 500);
+  setTimeout(pumpMp4Cache, 8000);
 }
 
 // Find a playable video for a post, looking beyond native reddit video:
@@ -1080,7 +1127,7 @@ function openEditor() {
   cacheBtn.onclick = async () => {
     if (CACHE_OK) await caches.delete(VIDCACHE);
     vidIndex = {};
-    saveVidIndex();
+    flushVidIndex();
     cacheBtn.textContent = 'Video cache cleared ✓';
   };
   card.appendChild(cacheBtn);
@@ -1455,16 +1502,30 @@ function videoSlide(post) {
     }, 1800);
   });
 
-  // current video comfortably ahead → hand idle bandwidth to the next slide
+  // first frame of the current slide opens the warm gate for its neighbours
+  const firstFrame = () => { s._loadedOnce = true; s._hlsFails = 0; if (s === currentSlide) openWarmGate(); };
+  v.addEventListener('canplay', firstFrame);
+  v.addEventListener('playing', firstFrame);
+
+  // current video comfortably ahead (or fully buffered, for short clips) →
+  // hand idle bandwidth to the next slide
   const maybePromoteNext = () => {
     if (v.paused) return;
     try {
       const b = v.buffered;
-      if (b.length && b.end(b.length - 1) - v.currentTime > 10) promoteNextSlide(s);
+      if (!b.length) return;
+      const end = b.end(b.length - 1);
+      const full = isFinite(v.duration) && v.duration > 0 && end >= v.duration - 0.3;
+      if (end - v.currentTime > 10 || full) promoteNextSlide(s);
     } catch {}
   };
   v.addEventListener('progress', maybePromoteNext);
-  v.addEventListener('canplaythrough', () => { if (!v.paused) promoteNextSlide(s); });
+  v.addEventListener('playing', maybePromoteNext);
+  // current video stalled → take the bandwidth back from the next one
+  v.addEventListener('waiting', () => {
+    const n = nextVideoSlide(s);
+    if (n && n._hls && n._hls.config.maxBufferLength > WARM_BUFFER_S) n._hls.config.maxBufferLength = WARM_BUFFER_S;
+  });
 
   // buffering spinner — visible whenever the video is stalled waiting for data
   const buf = el('div', 'buffer-spinner');
@@ -1487,7 +1548,7 @@ function videoSlide(post) {
 
   // tap video to pause/resume
   s.addEventListener('click', () => {
-    if (v.paused) { attachHls(s); v.play().catch(() => {}); s.classList.remove('paused'); }
+    if (v.paused) { attachHls(s, true); startWarm(s); v.play().catch(() => {}); s.classList.remove('paused'); }
     else { v.pause(); s.classList.add('paused'); }
   });
 
@@ -1495,7 +1556,7 @@ function videoSlide(post) {
 }
 
 // mp4 playback: external files play as-is; v.redd.it mp4s are video-only, so
-// pair them with a separate audio element
+// pair them with a separate audio element. Resolves once the src is set.
 function armMp4(s, url) {
   const v = s._video, media = s.querySelector('.media');
   if (s._audio) return setMp4Src(s, v, url);
@@ -1506,7 +1567,7 @@ function armMp4(s, url) {
   s._path = 'mp4+audio-el';
   // Reddit's audio filename varies by transcoding era, so walk the candidates
   // until one loads.
-  setMp4Src(s, v, url);
+  const ready = setMp4Src(s, v, url);
   const cut = url.indexOf('?');
   const query = cut >= 0 ? url.slice(cut) : '';
   const base = url.slice(0, url.lastIndexOf('/'));
@@ -1528,6 +1589,7 @@ function armMp4(s, url) {
   v.addEventListener('play', () => { if (soundOn) { a.currentTime = v.currentTime; a.play().catch(() => {}); } });
   v.addEventListener('pause', () => a.pause());
   v.addEventListener('seeked', () => { a.currentTime = v.currentTime; });
+  return ready;
 }
 
 function toggleSound() {
@@ -1651,12 +1713,42 @@ function imageSlide(post) {
 const WARM_BUFFER_S = 6;
 const FULL_BUFFER_S = 30;
 
-function attachHls(s) {
+// every new Hls instance starts ABR from the last measured network speed
+const BW_MIN = 300_000, BW_MAX = 20_000_000;
+let netBwBps = (() => {
+  try { const v = +localStorage.getItem('rs.bw'); return v >= BW_MIN && v <= BW_MAX ? v : 1_000_000; }
+  catch { return 1_000_000; }
+})();
+let warmGateOpen = false, warmGateTimer = 0, bwSaveT = 0;
+
+// Warm gate: neighbours only download fragments once the current slide has
+// its first frame (or after 2.5s), so they don't split its first fragment's
+// bandwidth. Until then a warm hls.js instance holds just its playlists.
+function startWarm(s) {
+  if (s && s._hls && !s._loadStarted) { s._loadStarted = true; s._hls.startLoad(-1); }
+}
+function openWarmGate() {
+  if (warmGateOpen) return;
+  warmGateOpen = true;
+  clearTimeout(warmGateTimer);
+  let n = currentSlide && currentSlide.nextElementSibling, k = 0;
+  while (n && k < 2) {
+    if (n._video) { startWarm(n); k++; }
+    n = n.nextElementSibling;
+  }
+  let p = currentSlide && currentSlide.previousElementSibling;
+  while (p && !p._video) p = p.previousElementSibling;
+  startWarm(p);
+}
+
+function attachHls(s, current = false) {
   if (!s._hlsUrl || s._hls) return;
   const h = new Hls({
     capLevelToPlayerSize: true,   // don't pull 1080p for a phone-sized viewport
     startLevel: 0,                // first frame ASAP at low quality; ABR upgrades
-    startFragPrefetch: true,      // fetch the first fragment alongside the playlist
+    autoStartLoad: false,         // fragments wait for startWarm (the warm gate)
+    abrEwmaDefaultEstimate: netBwBps,
+    startFragPrefetch: current,   // fetch the first fragment alongside the playlist
     maxBufferLength: WARM_BUFFER_S, // off-screen slides only grab an instant-start
                                     // buffer; promoted to FULL_BUFFER_S when current
     backBufferLength: 10,         // small enough to not hog memory/bandwidth
@@ -1666,18 +1758,53 @@ function attachHls(s) {
                                   // silent fallback can kill the audio pipeline
     fLoader: makeCacheFragLoader(),  // disk-cache segments for instant rewatch
   });
+  // self-heal instead of freezing on the poster; a stream that keeps dying
+  // degrades to the mp4
   h.on(Hls.Events.ERROR, (_, d) => {
     s._hlsErr = d.type + '/' + d.details + (d.fatal ? ' FATAL' : '');
-    if (d.fatal) {
-      // self-heal instead of freezing on the poster
-      if (d.type === Hls.ErrorTypes.NETWORK_ERROR) h.startLoad();
-      else if (d.type === Hls.ErrorTypes.MEDIA_ERROR) h.recoverMediaError();
-    }
+    if (!d.fatal || s._hls !== h) return;
+    s._hlsFails = (s._hlsFails || 0) + 1;
+    const giveUp = () => {
+      detachHls(s);
+      s._hlsUrl = null;
+      if (!s._fallbackUrl) return;
+      armMp4(s, s._fallbackUrl).then(() => {
+        if (!s._dead && isCentered(s) && !s.classList.contains('paused')) s._video.play().catch(() => {});
+      });
+    };
+    if (s._hlsFails > 3) return giveUp();
+    if (d.type === Hls.ErrorTypes.NETWORK_ERROR) {
+      // startLoad() can't recover a manifest that never loaded — reload it.
+      // loadSource() stops loading, so re-request it if it had started.
+      if (!h.levels || !h.levels.length) {
+        setTimeout(() => {
+          if (s._hls !== h) return;
+          h.loadSource(s._hlsUrl);
+          if (s._loadStarted) h.startLoad(-1);
+        }, 1000);
+      } else if (s._loadStarted) h.startLoad();
+    } else if (d.type === Hls.ErrorTypes.MEDIA_ERROR) {
+      if (s._hlsFails === 2) h.swapAudioCodec();
+      h.recoverMediaError();
+    } else giveUp();
+  });
+  // learn the network speed from real downloads only (not cache hits)
+  h.on(Hls.Events.FRAG_BUFFERED, (_, d) => {
+    if (d.frag.type !== 'main' || d.frag.sn === 'initSegment' || d.frag.stats._fromCache || d.frag.stats.aborted) return;
+    const bw = h.bandwidthEstimate;
+    if (!(bw > 0)) return;
+    netBwBps = Math.min(BW_MAX, Math.max(BW_MIN, bw));
+    if (!bwSaveT) bwSaveT = setTimeout(() => {
+      bwSaveT = 0;
+      try { localStorage.setItem('rs.bw', String(Math.round(netBwBps))); } catch {}
+    }, 5000);
   });
   h.loadSource(s._hlsUrl);
   h.attachMedia(s._video);
   s._hls = h;
   liveHls.add(s);
+  s._loadStarted = false;
+  if (current) startWarm(s);
   s._video.muted = !soundOn;
 }
 function detachHls(s) {
@@ -1706,10 +1833,17 @@ function clearFeed() {
   feed.replaceChildren();
   feed.scrollTop = 0;
   currentSlide = null;
+  warmGateOpen = false;   // a new feed's first slide gets the bandwidth alone
+  clearTimeout(warmGateTimer);
 }
 function onBecameCurrent(s) {
   currentSlide = s;
   armRedgifs(s);
+  warmGateOpen = false;
+  clearTimeout(warmGateTimer);
+  if (!s._video || s._loadedOnce) openWarmGate();
+  else warmGateTimer = setTimeout(openWarmGate, 2500);
+  if (mp4Ctl) mp4Ctl.abort();   // background caching yields to the new slide
   // later items append here
 }
 
@@ -1739,7 +1873,10 @@ function armRedgifs(s) {
       s._path = 'hls.js(rg-fallback)';
       s._hlsUrl = rv.hls_url;
       s._fallbackUrl = rv.fallback_url;
-      if (live) attachHls(s);
+      if (live) {
+        attachHls(s, s === currentSlide);
+        if (s === currentSlide || warmGateOpen) startWarm(s);
+      }
       // io sized liveHls before this instance existed
       if (s._hls && s === currentSlide) s._hls.config.maxBufferLength = FULL_BUFFER_S;
     } else if (rv.fallback_url) {
@@ -1755,13 +1892,20 @@ function armRedgifs(s) {
 // Waterfall prefetch: once the CURRENT video is comfortably buffered, spend
 // the now-idle bandwidth deepening the NEXT video instead of leaving it at
 // the minimal warm buffer — so the next swipe starts instantly.
+function nextVideoSlide(s) {
+  let n = s.nextElementSibling;
+  while (n && !n._video) n = n.nextElementSibling;   // skip stills
+  return n;
+}
 function promoteNextSlide(s) {
-  let next = s.nextElementSibling;
-  while (next && !next._video) next = next.nextElementSibling;   // skip stills
+  const next = nextVideoSlide(s);
   if (!next) return;
   armRedgifs(next);
+  // beyond warm range warmIO would never tear a new instance down
+  if (!next._hls && next.getBoundingClientRect().top > innerHeight * 2.5) return;
   if (next._hlsUrl) {
     attachHls(next);
+    startWarm(next);
     if (next._hls && next._hls.config.maxBufferLength < 15) {
       next._hls.config.maxBufferLength = 15;
     }
@@ -1779,7 +1923,8 @@ const io = new IntersectionObserver(entries => {
     if (!s._video) continue;
     if (e.isIntersecting && e.intersectionRatio >= 0.6) {
       s.classList.remove('paused');
-      attachHls(s);
+      attachHls(s, true);
+      startWarm(s);
       // this video gets the bandwidth: deep buffer for it, starve the others
       // back down to their instant-start buffer
       for (const other of liveHls) {
@@ -1823,6 +1968,7 @@ const warmIO = new IntersectionObserver(entries => {
       armRedgifs(s);
       if (s._hlsUrl) {
         attachHls(s);
+        if (warmGateOpen) startWarm(s);   // else it parks with only its playlists
       } else {
         // slide coming back into range after a cold teardown — re-arm from cache
         if (!v.getAttribute('src')) {
@@ -1845,9 +1991,9 @@ const warmIO = new IntersectionObserver(entries => {
       // free decoder, buffers and blob; re-armed above if the slide ever
       // scrolls back into range
       releaseMedia(s);
-      // a watched mp4/redgifs video becomes a cache candidate now that it's
-      // off-screen and can't compete with the playing video for bandwidth
-      if (s._played && s._mp4Url) queueMp4Cache(s._mp4Url);
+      // a watched, saved mp4/redgifs video becomes a cache candidate now that
+      // it's off-screen (the download still yields to every swipe)
+      if (s._played && s._mp4Url && isSaved(s._post && s._post.id)) queueMp4Cache(s._mp4Url);
     }
   }
 }, { rootMargin: '150% 0px 150% 0px', threshold: 0 });
@@ -1856,19 +2002,28 @@ const warmIO = new IntersectionObserver(entries => {
 // play() was ever issued on it DURING a user gesture. A swipe is a gesture:
 // on every touch/pointer release, synchronously play()+pause() the nearby
 // not-yet-blessed videos so they may autoplay WITH sound when swiped to.
-function blessNearbyVideos() {
-  if (!soundOn) return;
-  for (const s of feed.children) {
-    const v = s._video;
+// Chrome needs none of this. Each element is blessed once: the sync pause()
+// always rejects play() with AbortError, so only NotAllowedError retries.
+const NEEDS_BLESS = IS_SAFARI;
+let lastBlessTs = -1;
+function blessNearbyVideos(e) {
+  if (!soundOn || !NEEDS_BLESS) return;
+  if (e) {                                       // touchend + pointerup: one gesture
+    if (e.timeStamp - lastBlessTs < 80) return;
+    lastBlessTs = e.timeStamp;
+  }
+  const base = currentSlide || feed.firstElementChild;
+  if (!base) return;
+  const after = base.nextElementSibling;
+  const near = [base.previousElementSibling, base, after, after && after.nextElementSibling];
+  for (const s of near) {
+    const v = s && s._video;
     if (!v || s._blessed) continue;
-    const r = s.getBoundingClientRect();
-    if (r.top > innerHeight * 3 || r.bottom < -innerHeight) continue;
     s._blessed = true;
     if (!v.paused) continue;                     // already playing (the current one)
-    attachHls(s);
     const p = v.play();                          // inside the gesture → grants sound
     v.pause();                                   // sync pause: no audible blip
-    if (p) p.catch(() => { s._blessed = false; });
+    if (p) p.catch(err => { if (err && err.name === 'NotAllowedError') s._blessed = false; });
   }
 }
 feed.addEventListener('touchend', blessNearbyVideos, { passive: true });
