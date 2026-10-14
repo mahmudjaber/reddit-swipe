@@ -287,6 +287,7 @@ const SEEN_MAX = 1500;
 let seenRing = [];
 try { seenRing = JSON.parse(localStorage.getItem('rs.seen')) || []; } catch {}
 if (!Array.isArray(seenRing)) seenRing = [];
+const pastSeen = new Set(seenRing);   // watched in earlier sessions (launch snapshot)
 let seenT = 0;
 function flushSeen() {
   clearTimeout(seenT);
@@ -298,7 +299,7 @@ function rememberSeen(id) {
   if (k >= 0) seenRing.splice(k, 1);
   seenRing.push(id);
   if (seenRing.length > SEEN_MAX) seenRing.splice(0, seenRing.length - SEEN_MAX);
-  shownIds.add(id);   // watched in any mode: no build this session repeats it
+  markShown(id);   // watched in any mode: no build this session repeats it
   if (!seenT) seenT = setTimeout(flushSeen, 2000);
 }
 addEventListener('pagehide', () => { if (seenT) flushSeen(); });
@@ -306,6 +307,8 @@ document.addEventListener('visibilitychange', () => { if (document.hidden && see
 
 const shownIds = new Set();  // shown this session plus watched before — refresh won't repeat these
 seenRing.forEach(id => shownIds.add(id));
+const sessionShown = new Set();  // shown or watched this session
+function markShown(id) { shownIds.add(id); sessionShown.add(id); }
 
 // single-sub mode
 let subAfter = null;
@@ -326,6 +329,7 @@ const my = {
   persona: null,
   spotlight: null,           // subs boosted this refresh so different subs lead
   recycled: false,           // whether shownIds was already recycled this build
+  stale: [],                 // usable posts skipped only for an earlier session's history
   deepFills: 0,              // extra refills this build spent paging past watched posts
   // the list this build fetches; the editor re-points `subs` while browsing feeds
   subs,
@@ -730,12 +734,12 @@ function videoInfoOf(post) {
   return null;
 }
 
-function usablePosts(data, skipShown) {
+// stale: collects the posts skipped only because an earlier session watched them
+function usablePosts(data, skipShown, stale) {
   const out = [];
   for (const child of data.data.children) {
     const post = child.data;
     if (post.stickied || seen.has(post.id)) continue;
-    if (skipShown && shownIds.has(post.id)) continue;
     if (post.over_18 && !showNsfw) continue;
     // redgifs: reddit's rehosted preview is always video-only; remember the id
     // so the slide can fetch the original (which has the audio) instead
@@ -746,6 +750,10 @@ function usablePosts(data, skipShown) {
     else if (post._redgifs) post._rv = {};   // no preview rehost — original only
     else if (!(post.is_gallery && post.media_metadata) && !isDirectImage(post)) continue;
     seen.add(post.id);
+    if (skipShown && shownIds.has(post.id)) {
+      if (stale && pastSeen.has(post.id) && !sessionShown.has(post.id)) stale.push(post);
+      continue;
+    }
     out.push(post);
   }
   return out;
@@ -938,7 +946,7 @@ function ensureBuffer() {
         my.afters[sub] = data.data.after || null;
         if (isHidden(sub)) return;                   // hidden while its page was in flight
         // never re-show this session's posts; aggregates like r/popular carry hidden subs' posts
-        const posts = usablePosts(data, true).filter(p => !isHidden(p.subreddit));
+        const posts = usablePosts(data, true, my.stale).filter(p => !isHidden(p.subreddit));
         my.videoYield[sub] = (my.videoYield[sub] || 0) + posts.filter(p => p._rv).length;
         my.buffer.push(...posts);
         notifyBuffer();
@@ -981,10 +989,19 @@ async function myLoadMore() {
       if (g === gen && !my.buffer.length) await fill;
     } else if (my.buffer.length < BATCH_SIZE) await fill;
     if (g !== gen || mode !== 'my') return;
-    const batch = pickBatch(my.buffer, my.seed, BATCH_SIZE);
-    for (const post of batch) {
-      const slide = buildSlide(post);
-      if (slide) { feed.appendChild(slide); shownIds.add(post.id); }
+    const render = () => {
+      for (const post of pickBatch(my.buffer, my.seed, BATCH_SIZE)) {
+        const slide = buildSlide(post);
+        if (slide) { feed.appendChild(slide); markShown(post.id); }
+      }
+    };
+    render();
+    const exhausted = my.subs.every(s => my.afters[s] === null || isHidden(s));
+    if (feed.children.length === 0 && my.stale.length && (exhausted || my.deepFills > 0)) {
+      // nothing new even a page deeper: replay earlier sessions' posts already
+      // fetched, rather than refetching every sub from page 1
+      my.buffer.push(...my.stale.splice(0).filter(p => !isHidden(p.subreddit)));
+      render();
     }
     if (feed.children.length > 0) {
       hideStatus();
@@ -995,7 +1012,6 @@ async function myLoadMore() {
         if (chip) chip.title = feeds[activeFeed].name + ' · ' + my.persona.name;
       }
     } else {
-      const exhausted = my.subs.every(s => my.afters[s] === null || isHidden(s));
       if (exhausted && my.subs.length && my.subs.every(isHidden)) return showStatus('Every subreddit in this feed is hidden — unhide some in ＋ → Advanced', false, EDIT_FEEDS);
       if (!exhausted && my.deepFills < 3) {
         // every fetched post was watched before; page deeper before recycling
@@ -1012,6 +1028,7 @@ async function myLoadMore() {
         shownIds.clear();
         seen.clear();
         my.afters = {};
+        my.stale = [];
         loading = false;
         return await myLoadMore();   // await: our finally must not clear the retry's loading flag
       }
@@ -1042,6 +1059,7 @@ function enterMyFeed(reset) {
     my.slot = 0;
     my.videoYield = {};
     my.recycled = false;
+    my.stale = [];
     my.deepFills = 0;
     seenRing.forEach(id => shownIds.add(id));   // a recycle cleared it for the last build only
     seen.clear();
