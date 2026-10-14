@@ -27,6 +27,10 @@ const DEMO = new URLSearchParams(location.search).has('demo');
 // Running as a Chrome extension page: host_permissions let us call reddit.com
 // directly with the user's own logged-in session — no proxy needed.
 const EXTENSION = location.protocol === 'chrome-extension:';
+// NB: don't trust canPlayType('application/vnd.apple.mpegurl') — Chrome
+// answers "maybe" but can't actually play HLS, leaving a frozen poster.
+const IS_SAFARI = /iPhone|iPad|iPod/.test(navigator.userAgent) ||
+  (/Safari\//.test(navigator.userAgent) && !/Chrome|Chromium|Edg\/|OPR\//.test(navigator.userAgent));
 
 const feed = document.getElementById('feed');
 const topbar = document.getElementById('topbar');
@@ -359,18 +363,26 @@ function makeCacheFragLoader() {
 // mp4 paths: play from cache when we have it (via blob URL), else network
 async function setMp4Src(s, v, url) {
   s._mp4Url = url;
+  const gen = s._gen = (s._gen || 0) + 1;   // a newer call (or a release) wins
+  const stale = () => s._dead || s._gen !== gen;
   if (CACHE_OK) {
     try {
       const cache = await caches.open(VIDCACHE);
+      if (stale()) return;
       const hit = await cache.match(cacheKeyOf(url));
+      if (stale()) return;
       if (hit) {
         bumpVidIndex(vidIdOf(url), 0);
-        s._blobUrl = URL.createObjectURL(await hit.blob());
+        const blob = await hit.blob();
+        if (stale()) return;
+        if (s._blobUrl) URL.revokeObjectURL(s._blobUrl);
+        s._blobUrl = URL.createObjectURL(blob);
         v.src = s._blobUrl;
         return;
       }
     } catch {}
   }
+  if (stale()) return;
   v.src = url;
 }
 
@@ -631,12 +643,12 @@ async function myLoadMore() {
         loading = false;
         return myLoadMore();
       }
-      showStatus('No playable posts found in your subreddits — edit the list with ＋', false);
+      showStatus('No playable posts found in your subreddits — edit the list with ＋', false, EDIT_FEEDS);
     }
     ensureBuffer(); // fire-and-forget refill for the next batch
   } catch (err) {
     console.error(err);
-    if (feed.children.length === 0) showStatus('Could not load your feed — ' + err.message, false);
+    if (feed.children.length === 0) showStatus('Could not load your feed — ' + err.message, false, EDIT_FEEDS);
   } finally {
     loading = false;
   }
@@ -654,11 +666,10 @@ function enterMyFeed(reset) {
     my.videoYield = {};
     my.recycled = false;
     seen.clear();
-    feed.replaceChildren();
-    feed.scrollTop = 0;
+    clearFeed();
   }
   highlightChip('feed:' + activeFeed);
-  if (subs.length === 0) return showStatus('This feed is empty — tap ＋ to add subreddits', false);
+  if (subs.length === 0) return showStatus(EMPTY_FEED_MSG, false, EDIT_FEEDS);
   showStatus(`Mixing ${my.persona ? my.persona.name : 'your feed'}…`);
   myLoadMore();
 }
@@ -701,8 +712,7 @@ function enterSub(sub, resetSort) {
   subAfter = null;
   subExhausted = false;
   seen.clear();
-  feed.replaceChildren();
-  feed.scrollTop = 0;
+  clearFeed();
   highlightChip(sub);
   const [sort, t] = SORTS[subSortIdx];
   showStatus(`Loading r/${sub} (${sort}${t ? ' · ' + t : ''})…`);
@@ -972,6 +982,13 @@ function openEditor() {
   done.onclick = () => {
     saveSubs();
     overlay.remove();
+    if (subs.length === 0) {
+      mode = 'my';
+      currentSub = null;
+      clearFeed();   // nothing may keep playing behind the status layer
+      rebuildTopbar();
+      return showStatus(EMPTY_FEED_MSG, false, EDIT_FEEDS);
+    }
     rebuildTopbar();
     enterMyFeed(true);
   };
@@ -1027,8 +1044,7 @@ async function downloadPost(post, s, btn) {
 function enterSavedFeed(startId) {
   mode = 'saved';
   currentSub = null;
-  feed.replaceChildren();
-  feed.scrollTop = 0;
+  clearFeed();
   highlightChip('profile');
   let target = null;
   for (const p of savedPosts) {
@@ -1145,12 +1161,35 @@ async function soundDebug() {
 /* =======================================================================
    STATUS
    ======================================================================= */
-function showStatus(msg, spin = true) {
+function showStatus(msg, spin = true, action) {
   statusEl.classList.remove('hidden');
   statusEl.querySelector('.spinner').style.display = spin ? '' : 'none';
   statusText.textContent = msg;
+  statusEl.querySelector('.status-action')?.remove();
+  if (action) {
+    const b = el('button', 'editor-btn status-action', action.label);
+    b.onclick = e => { e.stopPropagation(); action.onClick(); };
+    statusEl.appendChild(b);
+  }
 }
 function hideStatus() { statusEl.classList.add('hidden'); }
+const EDIT_FEEDS = { label: 'Edit feeds', onClick: openEditor };
+const EMPTY_FEED_MSG = 'This feed is empty — add subreddits';
+
+let toastEl = null, toastT = 0;
+function toast(msg, { action, onAction, ms = 2500 } = {}) {
+  toastEl?.remove();
+  clearTimeout(toastT);
+  toastEl = el('div', 'toast');
+  toastEl.appendChild(el('span', null, msg));
+  if (action) {
+    const b = el('button', null, action);
+    b.onclick = e => { e.stopPropagation(); toastEl?.remove(); onAction(); };
+    toastEl.appendChild(b);
+  }
+  document.body.appendChild(toastEl);
+  toastT = setTimeout(() => { toastEl?.remove(); toastEl = null; }, ms);
+}
 statusEl.addEventListener('click', () => {
   if (!loading && feed.children.length === 0) {
     showStatus('Retrying…');
@@ -1183,6 +1222,9 @@ function railButton(iconChar, label, onClick) {
 
 function baseSlide(post, typeLabel) {
   const s = el('div', 'slide');
+  s._post = post;
+  s._sub = (post.subreddit || '').toLowerCase();
+  s._kind = post._rv ? 'video' : (post.is_gallery ? 'gallery' : 'still');
 
   const overlay = el('div', 'overlay');
   overlay.appendChild(el('div', 'sub', 'r/' + post.subreddit));
@@ -1235,6 +1277,7 @@ function setBadge(s, text) {
 function videoSlide(post) {
   const rv = post._rv || post.media.reddit_video;
   const s = baseSlide(post, null);
+  s._rv = rv;
 
   const media = el('div', 'media');
 
@@ -1247,13 +1290,12 @@ function videoSlide(post) {
   v.preload = 'none';
   v.poster = posterOf(post) || '';
 
+  media.appendChild(v);
+  s.prepend(media);
+  s._video = v;
+
   // Safari plays HLS natively (with sound); everywhere else use the mp4
   // fallback (video-only) plus a synced <audio> element for sound.
-  // NB: don't trust canPlayType('application/vnd.apple.mpegurl') — Chrome
-  // answers "maybe" but can't actually play HLS, leaving a frozen poster.
-  const ua = navigator.userAgent;
-  const isSafari = /iPhone|iPad|iPod/.test(ua) ||
-                   (/Safari\//.test(ua) && !/Chrome|Chromium|Edg\/|OPR\//.test(ua));
   // Reddit's is_gif/has_audio metadata is unreliable in BOTH directions, so it
   // never decides routing: anything with an HLS stream goes through HLS, which
   // carries the audio whenever the source has any.
@@ -1262,54 +1304,27 @@ function videoSlide(post) {
     // is a plain mp4 with the audio muxed in
     s._path = 'redgifs';
     resolveRedgifs(post._redgifs).then(url => {
-      if (!url) return;
+      if (!url || s._dead) return;
+      s._mp4Url = url;
+      if (!s._warm) return;   // out of range: warmIO arms it on approach
       return setMp4Src(s, v, url).then(() => {
         const r = s.getBoundingClientRect();
         if (r.top < innerHeight * 0.5 && r.bottom > innerHeight * 0.5) v.play().catch(() => {});
       });
     }).catch(() => {});
-  } else if (isSafari && rv.hls_url) {
+  } else if (IS_SAFARI && rv.hls_url) {
     s._path = 'native-hls';
+    s._src = rv.hls_url;
     v.src = rv.hls_url;        // native HLS — audio is muxed in
   } else if (rv.hls_url && window.Hls && Hls.isSupported()) {
     // hls.js — audio muxed in, adaptive bitrate for smoother buffering.
     // Attached lazily by the warm-up observer so off-screen slides cost nothing.
     s._path = 'hls.js';
     s._hlsUrl = rv.hls_url;
-  } else if (!/^https:\/\/v\.redd\.it\//.test(rv.fallback_url || '')) {
-    s._path = 'mp4-external';
-    setMp4Src(s, v, rv.fallback_url);   // e.g. imgur .gifv — no side-audio scheme exists
+    s._fallbackUrl = rv.fallback_url;
   } else {
-    s._path = 'mp4+audio-el';
-    // last resort: bare mp4 (video-only) + separate audio element. Reddit's
-    // audio filename varies by transcoding era, so walk the candidates until
-    // one loads.
-    setMp4Src(s, v, rv.fallback_url);
-    const cut = rv.fallback_url.indexOf('?');
-    const query = cut >= 0 ? rv.fallback_url.slice(cut) : '';
-    const base = rv.fallback_url.slice(0, rv.fallback_url.lastIndexOf('/'));
-    const AUDIO_NAMES = ['CMAF_AUDIO_128.mp4', 'CMAF_AUDIO_64.mp4', 'DASH_AUDIO_128.mp4',
-                         'DASH_AUDIO_64.mp4', 'DASH_audio.mp4', 'audio.mp4'];
-    let ai = 0;
-    const a = document.createElement('audio');
-    a.src = base + '/' + AUDIO_NAMES[ai] + query;
-    a.addEventListener('error', () => {
-      if (++ai >= AUDIO_NAMES.length) { setBadge(s, '🔇 no sound in this video'); return; }
-      a.src = base + '/' + AUDIO_NAMES[ai] + query;
-      if (soundOn && !v.paused) { a.currentTime = v.currentTime; a.play().catch(() => {}); }
-    });
-    a.preload = 'none';
-    a.loop = true;
-    s._audio = a;
-    media.appendChild(a);
-    v.addEventListener('play', () => { if (soundOn) { a.currentTime = v.currentTime; a.play().catch(() => {}); } });
-    v.addEventListener('pause', () => a.pause());
-    v.addEventListener('seeked', () => { a.currentTime = v.currentTime; });
+    armMp4(s, rv.fallback_url);
   }
-
-  media.appendChild(v);
-  s.prepend(media);
-  s._video = v;
 
   s.appendChild(el('div', 'paused-badge', '▶'));
 
@@ -1362,6 +1377,41 @@ function videoSlide(post) {
   });
 
   return s;
+}
+
+// mp4 playback: external files play as-is; v.redd.it mp4s are video-only, so
+// pair them with a separate audio element
+function armMp4(s, url) {
+  const v = s._video, media = s.querySelector('.media');
+  if (s._audio) return setMp4Src(s, v, url);
+  if (!/^https:\/\/v\.redd\.it\//.test(url || '')) {
+    s._path = 'mp4-external';
+    return setMp4Src(s, v, url);   // e.g. imgur .gifv — no side-audio scheme exists
+  }
+  s._path = 'mp4+audio-el';
+  // Reddit's audio filename varies by transcoding era, so walk the candidates
+  // until one loads.
+  setMp4Src(s, v, url);
+  const cut = url.indexOf('?');
+  const query = cut >= 0 ? url.slice(cut) : '';
+  const base = url.slice(0, url.lastIndexOf('/'));
+  const AUDIO_NAMES = ['CMAF_AUDIO_128.mp4', 'CMAF_AUDIO_64.mp4', 'DASH_AUDIO_128.mp4',
+                       'DASH_AUDIO_64.mp4', 'DASH_audio.mp4', 'audio.mp4'];
+  let ai = 0;
+  const a = document.createElement('audio');
+  a.src = base + '/' + AUDIO_NAMES[ai] + query;
+  a.addEventListener('error', () => {
+    if (++ai >= AUDIO_NAMES.length) { setBadge(s, '🔇 no sound in this video'); return; }
+    a.src = base + '/' + AUDIO_NAMES[ai] + query;
+    if (soundOn && !v.paused) { a.currentTime = v.currentTime; a.play().catch(() => {}); }
+  });
+  a.preload = 'none';
+  a.loop = true;
+  s._audio = a;
+  media.appendChild(a);
+  v.addEventListener('play', () => { if (soundOn) { a.currentTime = v.currentTime; a.play().catch(() => {}); } });
+  v.addEventListener('pause', () => a.pause());
+  v.addEventListener('seeked', () => { a.currentTime = v.currentTime; });
 }
 
 function toggleSound() {
@@ -1497,10 +1547,39 @@ function attachHls(s) {
   h.loadSource(s._hlsUrl);
   h.attachMedia(s._video);
   s._hls = h;
+  liveHls.add(s);
   s._video.muted = !soundOn;
 }
 function detachHls(s) {
-  if (s._hls) { s._hls.destroy(); s._hls = null; }
+  if (s._hls) { s._hls.destroy(); s._hls = null; liveHls.delete(s); }
+}
+
+let currentSlide = null;
+const liveHls = new Set();
+function releaseMedia(s, force) {
+  detachHls(s);
+  const v = s._video; if (!v) return;
+  s._gen = (s._gen || 0) + 1;                 // cancels in-flight setMp4Src/redgifs
+  v.pause(); if (s._audio) s._audio.pause();  // keep audio src: its candidate walk can't re-arm
+  const hadBlob = !!s._blobUrl;               // a revoked blob src must go even at preload=none
+  if (hadBlob) { URL.revokeObjectURL(s._blobUrl); s._blobUrl = null; }
+  if (v.getAttribute('src') && (force || hadBlob || v.preload !== 'none')) { v.removeAttribute('src'); v.load(); }
+  v.preload = 'none';
+}
+function teardownSlide(s) {
+  s._dead = true; io.unobserve(s); warmIO.unobserve(s);
+  releaseMedia(s, true); clearTimeout(s._audChk);
+  if (s._audio) { s._audio.removeAttribute('src'); s._audio.load(); }
+}
+function clearFeed() {
+  for (const s of feed.children) teardownSlide(s);
+  feed.replaceChildren();
+  feed.scrollTop = 0;
+  currentSlide = null;
+}
+function onBecameCurrent(s) {
+  currentSlide = s;
+  // later items append here
 }
 
 // Waterfall prefetch: once the CURRENT video is comfortably buffered, spend
@@ -1524,14 +1603,16 @@ function promoteNextSlide(s) {
 const io = new IntersectionObserver(entries => {
   for (const e of entries) {
     const s = e.target;
+    if (s._dead) continue;   // records queued before teardown still arrive
+    if (e.isIntersecting && e.intersectionRatio >= 0.6 && s !== currentSlide) onBecameCurrent(s);
     if (!s._video) continue;
     if (e.isIntersecting && e.intersectionRatio >= 0.6) {
       s.classList.remove('paused');
       attachHls(s);
       // this video gets the bandwidth: deep buffer for it, starve the others
       // back down to their instant-start buffer
-      for (const other of feed.children) {
-        if (other._hls) other._hls.config.maxBufferLength = other === s ? FULL_BUFFER_S : WARM_BUFFER_S;
+      for (const other of liveHls) {
+        other._hls.config.maxBufferLength = other === s ? FULL_BUFFER_S : WARM_BUFFER_S;
       }
       if (s._video.preload !== 'auto') s._video.preload = 'auto';
       if (!s._audio) s._video.muted = !soundOn;   // hls/native slides follow global sound
@@ -1559,13 +1640,17 @@ const warmIO = new IntersectionObserver(entries => {
   for (const e of entries) {
     const s = e.target;
     const v = s._video;
-    if (!v) continue;
+    if (!v || s._dead) continue;
+    s._warm = e.isIntersecting;
     if (e.isIntersecting) {
       if (s._hlsUrl) {
         attachHls(s);
       } else {
         // slide coming back into range after a cold teardown — re-arm from cache
-        if (s._mp4Url && !v.src) setMp4Src(s, v, s._mp4Url);
+        if (!v.getAttribute('src')) {
+          if (s._mp4Url) setMp4Src(s, v, s._mp4Url);
+          else if (s._src) v.src = s._src;
+        }
         if (v.preload === 'none') {
           // warm mp4s fetch headers/first bytes only — full download ('auto')
           // is reserved for the on-screen video so it never fights for bandwidth
@@ -1576,15 +1661,9 @@ const warmIO = new IntersectionObserver(entries => {
         }
       }
     } else {
-      detachHls(s);
-      // free the blob (whole file in memory) and drop the src; re-armed above
-      // if the slide ever scrolls back into range
-      if (s._blobUrl) {
-        URL.revokeObjectURL(s._blobUrl);
-        s._blobUrl = null;
-        v.removeAttribute('src');
-        v.load();
-      }
+      // free decoder, buffers and blob; re-armed above if the slide ever
+      // scrolls back into range
+      releaseMedia(s);
       // a watched mp4/redgifs video becomes a cache candidate now that it's
       // off-screen and can't compete with the playing video for bandwidth
       if (s._played && s._mp4Url) queueMp4Cache(s._mp4Url);
@@ -1617,10 +1696,9 @@ feed.addEventListener('pointerup', blessNearbyVideos, { passive: true });
 // recovery: if a browser silently stripped sound (blocked unmute), any click
 // re-asserts it on whatever is currently playing
 document.addEventListener('click', () => {
-  if (!soundOn) return;
-  document.querySelectorAll('.slide').forEach(s => {
-    if (s._video && !s._video.paused && !s._audio) s._video.muted = false;
-  });
+  if (!soundOn || !currentSlide) return;
+  const s = currentSlide;
+  if (s._video && !s._video.paused && !s._audio) s._video.muted = false;
 });
 
 new MutationObserver(muts => {
