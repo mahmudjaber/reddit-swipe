@@ -1,4 +1,4 @@
-const APP_VERSION = '1.22.1';   // shown in the ＋ editor — bump with manifest.json
+const APP_VERSION = '1.23.0';   // shown in the ＋ editor — bump with manifest.json
 
 /* ================= CONFIG ================= */
 // Default subreddits for first launch — after that, edit your list in the app
@@ -112,7 +112,7 @@ const isHidden = s => hiddenSubs.has((s || '').toLowerCase());
 let savedPosts = [];
 try { savedPosts = JSON.parse(localStorage.getItem('rs.saved')); } catch {}
 // re-slimming shrinks saves made before slimPost trimmed galleries
-savedPosts = Array.isArray(savedPosts) ? savedPosts.filter(p => p && p.id).map(slimPost) : [];
+savedPosts = Array.isArray(savedPosts) ? savedPosts.filter(p => p && p.id).map(p => { try { return slimPost(p); } catch { return null; } }).filter(Boolean) : [];
 const SAVED_MAX = 300;   // localStorage budget — oldest save drops past this
 // runtime fields are rebuilt on load and must never reach storage
 function persistSaved() {
@@ -1951,7 +1951,7 @@ function baseSlide(post, typeLabel) {
 
 const permalinkOf = post => 'https://www.reddit.com' + post.permalink;
 function openOnReddit(post, s) {
-  window.open(permalinkOf(post), '_blank');
+  window.open(permalinkOf(post), '_blank', 'noopener');
   s._credit('open', 1);
 }
 async function sharePost(post, s) {
@@ -2097,7 +2097,7 @@ function videoSlide(post) {
     s._audChk = setTimeout(() => {
       if (v.paused || s._audio || v.webkitAudioDecodedByteCount === undefined) return;
       if (v.webkitAudioDecodedByteCount > 0) setBadge(s, null);          // it has sound
-      else setBadge(s, '🔇 no sound in this video');
+      else setBadge(s, s._rgFallback ? '🔇 original unavailable' : '🔇 no sound in this video');
     }, 1800);
   });
 
@@ -2603,6 +2603,7 @@ function armRedgifs(s) {
       // io's play() already fired 'play' before armMp4 hooked the side audio
       if (s._audio && soundOn && !s._video.paused) s._audio.play().catch(() => {});
     } else { setBadge(s, '⚠️ video unavailable'); return; }
+    s._rgFallback = true;
     setBadge(s, '🔇 original unavailable');
     if (isCentered(s)) s._video.play().catch(() => {});
   }).catch(() => {}).finally(() => { s._rgPending = false; });

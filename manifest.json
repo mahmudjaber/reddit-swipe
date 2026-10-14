@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Reddit Swipe",
-  "version": "1.22.1",
+  "version": "1.23.0",
   "description": "TikTok-style swipe feed for your favorite subreddits. Personal read-only viewer using your own Reddit session.",
   "action": {
     "default_title": "Open Reddit Swipe"
@@ -14,7 +14,9 @@
     "https://v.redd.it/*",
     "https://i.redd.it/*",
     "https://preview.redd.it/*",
-    "https://*.redgifs.com/*"
+    "https://*.redgifs.com/*",
+    "https://external-preview.redd.it/*",
+    "https://i.imgur.com/*"
   ],
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnPUl7ZdgEKFm1fs8oBW9HH1Trz0kxvYYHAL2bZRLyeIDQX322/4xZ+9TnmfhDFaVf67CcH6DbtnfHqj5KAB74kOvbmig8dXzoBACaVs52HhYmBUGK3Cdbb+9feZicAZxzi35xr7MVcPkINGvY4aLQfnFf6FswyNddQWlC8prK+mglX5w9+JhUvpf0kWQNKvMeb0XxG7/S0oFRqioFs0a6IzEfWV6uqzdCugHB9Fbz/ZVeJ2nIAIh9twNYPH9vidTolyix+umcuyYyxeO1eiGl1eIpTx1AaIe5gJv/gW1Cw0ZPbcKwApjDfstb/iMpUiVFzMWLCMUdC/zgEq2ZYSsswIDAQAB"
 }
