@@ -190,7 +190,7 @@ function paintSave(btn, id) {
 /* ---------- taste: local, decaying per-sub and per-format affinity ---------- */
 const TASTE_KEY = 'rs.taste', HALF_LIFE_D = 21, TASTE_MAX = 400;
 let T; try { T = JSON.parse(localStorage.getItem(TASTE_KEY)); } catch {}
-if (!T || T.v !== 1 || typeof T.subs !== 'object' || typeof T.fmt !== 'object') T = { v: 1, off: false, seeded: false, subs: {}, fmt: {} };
+if (!T || T.v !== 1 || !T.subs || typeof T.subs !== 'object' || !T.fmt || typeof T.fmt !== 'object') T = { v: 1, off: false, seeded: false, subs: {}, fmt: {} };
 const today = () => Math.floor(Date.now() / 864e5);
 // entries are [pos, neg, events, day]
 function decayed(e) { const f = 0.5 ** ((today() - e[3]) / HALF_LIFE_D); return [e[0] * f, e[1] * f, e[2], today()]; }
@@ -1756,6 +1756,7 @@ function baseSlide(post, typeLabel) {
   const s = el('div', 'slide');
   s._post = post;
   s._sub = (post.subreddit || '').toLowerCase();
+  s._mode = mode;   // a view is judged by the feed it was built for, not the one active at teardown
   s._kind = post._rv ? 'video' : (post.is_gallery ? 'gallery' : 'still');
 
   const overlay = el('div', 'overlay');
@@ -2507,16 +2508,17 @@ const engageIO = new IntersectionObserver(es => {
     const s = e.target;
     if (s.classList.contains('placeholder')) continue;
     if (e.isIntersecting && e.intersectionRatio >= 0.6) {
-      if (!s._enter && !s._dead && s.isConnected) {
-        s._enter = performance.now();
-        s._loops = 0;
-        s._lastT = 0;
-        s._ttff = s._loadedOnce ? 0 : null;
-        s._frames = s._frames || 1;
-      }
+      if (!s._enter && !s._dead && s.isConnected) startView(s);
     } else if (s._enter) logView(s);
   }
 }, { threshold: [0, 0.6] });
+function startView(s) {
+  s._enter = performance.now();
+  s._loops = 0;
+  s._lastT = 0;
+  s._ttff = s._loadedOnce ? 0 : null;
+  s._frames = s._frames || 1;
+}
 
 // Turns one view into a taste signal. Video time only counts from the first
 // frame, and a slow start is skipped: that is the network, not the viewer.
@@ -2524,7 +2526,7 @@ function logView(s) {
   const dwell = performance.now() - s._enter;
   s._enter = 0;
   const post = s._post;
-  if (!post || mode === 'saved') return;
+  if (!post || s._mode === 'saved') return;
   if (dwell < 250) return;   // passed over by a programmatic scroll, not a choice
   let sig = 0;
   if (s._video) {
@@ -2541,8 +2543,15 @@ function logView(s) {
   taste.event(post, sig);
   if (dwell > 1500) rememberSeen(post.id);
 }
+// the flush listeners above ran before this view was logged; WebKit may never
+// run their timers once backgrounded
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden && currentSlide && currentSlide._enter) logView(currentSlide);
+  const s = currentSlide;
+  if (document.hidden) {
+    if (s && s._enter) logView(s);
+    if (tasteT) flushTaste();
+    if (seenT) flushSeen();
+  } else if (s && !s._enter && !s._dead && s.isConnected && isCentered(s)) startView(s);   // engageIO won't fire again for it
 });
 
 // warm-up: when a slide is within ~2.5 screens of the viewport, start
