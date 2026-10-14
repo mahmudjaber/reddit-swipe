@@ -250,7 +250,7 @@ let stash = null;            // the 'my' feed parked while saved or single-sub m
 let loading = false;
 // bumped on every feed rebuild — in-flight loads from an older build drop their results
 let gen = 0;
-function newBuild() { gen++; loading = false; my.fetchP = null; bufWaiters.splice(0).forEach(r => r()); setBusy(false); }
+function newBuild() { gen++; loading = false; my.fetchP = null; bufWaiters.splice(0).forEach(r => r()); setBusy(false); abortStaleFetches(); }
 // a replaced build never reaches its own finally, so newBuild clears the spin too
 function setBusy(on) { document.getElementById('refresh-chip')?.classList.toggle('busy', on); }
 let soundOn = false;        // global mute state (autoplay must start muted)
@@ -299,6 +299,9 @@ const my = {
   persona: null,
   spotlight: null,           // subs boosted this refresh so different subs lead
   recycled: false,           // whether shownIds was already recycled this build
+  deepFills: 0,              // extra refills this build spent paging past watched posts
+  // the list this build fetches; the editor re-points `subs` while browsing feeds
+  subs,
   order: null,               // this build's seeded sub order (fetch priority)
   announced: 0,              // gen whose persona was already toasted
 };
@@ -309,7 +312,7 @@ let bufWaiters = [];
 function notifyBuffer(force) {
   const vids = my.buffer.reduce((c, p) => c + (p._rv ? 1 : 0), 0);
   const subsIn = new Set(my.buffer.map(p => p.subreddit)).size;
-  const live = subs.filter(s => !isHidden(s)).length;
+  const live = my.subs.filter(s => !isHidden(s)).length;
   if (force || (my.buffer.length >= BATCH_SIZE && vids >= 4 && subsIn >= Math.min(3, live))) bufWaiters.splice(0).forEach(r => r());
 }
 const bufferReady = () => new Promise(r => { bufWaiters.push(r); notifyBuffer(); });
@@ -358,6 +361,7 @@ function withTimeout(ms) {
     signal: ctl.signal,
     start: () => { clearTimeout(t); t = setTimeout(() => ctl.abort(), ms); },
     done: () => clearTimeout(t),
+    abort: () => ctl.abort(),
   };
 }
 
@@ -368,6 +372,11 @@ function politeFetch(url, opts, timer, stale) {
     fetchQueue.push({ url, opts, timer, stale, resolve, reject });
     pumpQueue();
   });
+}
+// requests already sent: a replaced build aborts its own so they free their slots now
+const inflight = new Set();
+function abortStaleFetches() {
+  for (const j of inflight) if (j.stale && j.stale() && j.timer) j.timer.abort();
 }
 let queuePausedUntil = 0;
 async function pumpQueue() {
@@ -381,6 +390,7 @@ async function pumpQueue() {
     return;
   }
   activeFetches++;
+  inflight.add(job);
   try {
     if (job.timer) job.timer.start();
     const res = await fetch(job.url, job.opts);
@@ -397,6 +407,7 @@ async function pumpQueue() {
   } catch (e) {
     job.reject(e);
   } finally {
+    inflight.delete(job);
     activeFetches--;
     setTimeout(pumpQueue, SPACING_MS);
   }
@@ -446,6 +457,7 @@ async function fetchSubPage(sub, sort, t, cursor, stale) {
       if (!cursor) pageCachePut(url, json);
       return json;
     } catch (e) {
+      if (stale && stale()) throw e;   // aborted by newBuild, not a timeout: never re-queue
       if (to.signal.aborted && attempt === 0) continue;
       // must not match the 403|404|451 blacklist test in ensureBuffer
       if (to.signal.aborted) throw new Error('network timeout — tap to retry');
@@ -860,7 +872,7 @@ function ensureBuffer() {
       if (g !== gen) return;
       const videoCount = my.buffer.reduce((c, p) => c + (p._rv ? 1 : 0), 0);
       if (my.buffer.length >= MIN_BUFFER && videoCount >= MIN_VIDEO_BUFFER) return;
-      let pending = subs.filter(s => my.afters[s] !== null && !isHidden(s)); // null = exhausted
+      let pending = my.subs.filter(s => my.afters[s] !== null && !isHidden(s)); // null = exhausted
       if (round > 0) {
         const yielding = pending.filter(s => (my.videoYield[s] || 0) > 0);
         if (yielding.length) pending = yielding;
@@ -915,8 +927,11 @@ async function myLoadMore() {
   try {
     const fill = ensureBuffer();
     fill.catch(() => {});
-    if (feed.children.length === 0) await Promise.race([fill, bufferReady()]);
-    else if (my.buffer.length < BATCH_SIZE) await fill;
+    if (feed.children.length === 0) {
+      await Promise.race([fill, bufferReady()]);
+      // an empty buffer means the forced wake-up: fill has settled, so this rethrows its real error
+      if (g === gen && !my.buffer.length) await fill;
+    } else if (my.buffer.length < BATCH_SIZE) await fill;
     if (g !== gen || mode !== 'my') return;
     const batch = pickBatch(my.buffer, my.seed, BATCH_SIZE);
     for (const post of batch) {
@@ -931,9 +946,19 @@ async function myLoadMore() {
         const chip = topbar.querySelector(`[data-key="feed:${activeFeed}"]`);
         if (chip) chip.title = feeds[activeFeed].name + ' · ' + my.persona.name;
       }
-    } else if (subs.every(s => my.afters[s] === null || isHidden(s))) {
-      if (subs.length && subs.every(isHidden)) return showStatus('Every subreddit in this feed is hidden — unhide some in ＋ → Advanced', false, EDIT_FEEDS);
-      // everything ever fetched was already shown this session — recycle once
+    } else {
+      const exhausted = my.subs.every(s => my.afters[s] === null || isHidden(s));
+      if (exhausted && my.subs.length && my.subs.every(isHidden)) return showStatus('Every subreddit in this feed is hidden — unhide some in ＋ → Advanced', false, EDIT_FEEDS);
+      if (!exhausted && my.deepFills < 3) {
+        // every fetched post was watched before; page deeper before recycling
+        my.deepFills++;
+        showStatus('Looking past posts you\'ve seen…');
+        const live = () => g === gen && mode === 'my' && feed.children.length === 0;
+        ensureBuffer().then(() => { if (live()) myLoadMore(); },
+          e => { if (live()) showStatus('Could not load your feed — ' + e.message, false, EDIT_FEEDS); });
+        return;
+      }
+      // everything fetched was already shown — recycle once
       if (!my.recycled && shownIds.size) {
         my.recycled = true;
         shownIds.clear();
@@ -942,8 +967,9 @@ async function myLoadMore() {
         loading = false;
         return await myLoadMore();   // await: our finally must not clear the retry's loading flag
       }
-      showStatus('No playable posts found in your subreddits — edit the list with ＋', false, EDIT_FEEDS);
-    } else showStatus('Nothing loaded yet — tap to retry', false);
+      if (exhausted) showStatus('No playable posts found in your subreddits — edit the list with ＋', false, EDIT_FEEDS);
+      else showStatus('Nothing loaded yet — tap to retry', false);
+    }
     ensureBuffer().catch(() => {}); // fire-and-forget refill for the next batch
   } catch (err) {
     console.error(err);
@@ -961,12 +987,14 @@ function enterMyFeed(reset) {
   if (reset) {
     newBuild();
     my.seed = (Math.random() * 2 ** 31) | 0;
+    my.subs = subs;
     my.sorts = rotatedSortPlan();
     my.buffer = [];
     my.afters = {};
     my.slot = 0;
     my.videoYield = {};
     my.recycled = false;
+    my.deepFills = 0;
     seen.clear();
     clearFeed();
   }
@@ -1719,6 +1747,7 @@ function toast(msg, { action, onAction, ms = 2500 } = {}) {
 statusEl.addEventListener('click', () => {
   if (!loading && feed.children.length === 0) {
     if (mode === 'saved') return;   // finite: there is nothing to retry
+    if (mode === 'sub' && subExhausted) return;   // the listing ended with nothing playable
     // the empty and 18+ statuses stay: a retry would fetch the 18+ feed anyway
     if (mode === 'my' && (subs.length === 0 || (!showNsfw && isNsfwFeed(feeds[activeFeed])))) return;
     // un-blacklist subs a logged-out 403 (or a 404 blip) marked exhausted
