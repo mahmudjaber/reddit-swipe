@@ -2037,6 +2037,7 @@ const warmIO = new IntersectionObserver(entries => {
     if (s._dead) continue;   // incl. placeholders cleared by clearFeed
     if (e.isIntersecting && s.classList.contains('placeholder')) {
       warmIO.unobserve(s); io.unobserve(s);
+      s._dead = true;   // a second record for it in this batch must not build again
       // the fallback is not a placeholder, so a post that no longer builds can't loop
       const ns = s._post && buildSlide(s._post);
       s.replaceWith(ns || el('div', 'slide'));   // the MutationObserver observes the new node
