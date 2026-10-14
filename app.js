@@ -2087,6 +2087,7 @@ function toggleSound() {
     if (s._audio) {           // mp4 + separate audio track
       if (soundOn && !s._video.paused) {
         s._audio.currentTime = s._video.currentTime;
+        s._audioBlessed = true;   // played inside the tap
         s._audio.play().catch(() => {});
       } else {
         s._audio.pause();
@@ -2514,14 +2515,17 @@ const io = new IntersectionObserver(entries => {
       }
       if (s._video.preload !== 'auto') s._video.preload = 'auto';
       if (!s._audio) s._video.muted = !soundOn;   // hls/native slides follow global sound
+      // a released native-HLS slide: src must land before play(), or warmIO's
+      // later re-arm aborts this play()
+      if (s._src && !s._video.getAttribute('src')) s._video.src = s._src;
       const p = s._video.play();
-      if (p) p.catch(() => {
+      if (p) p.catch(err => {
         // WebKit (Safari/Orion) refuses unmuted programmatic play on elements
-        // it hasn't user-activated — better muted than frozen
-        if (!s._video.muted) {
-          s._video.muted = true;
-          s._video.play().catch(() => {});
-        }
+        // it hasn't user-activated — better muted than frozen. Any other
+        // rejection (AbortError from a pause/src change) stays paused.
+        if (!err || err.name !== 'NotAllowedError' || s !== currentSlide || s._video.muted) return;
+        s._video.muted = true;
+        s._video.play().catch(() => {});
       });
     } else {
       s._video.pause();
@@ -2586,6 +2590,8 @@ document.addEventListener('visibilitychange', () => {
 // warm-up: when a slide is within ~2.5 screens of the viewport, start
 // downloading its video so it plays instantly when swiped to; when it
 // drifts far away again, tear the hls instance down to free memory.
+// Root is #feed: it is the scroller and clips the slides, so a viewport root's
+// margin would never reach them.
 const warmIO = new IntersectionObserver(entries => {
   for (const e of entries) {
     const s = e.target;
@@ -2638,7 +2644,7 @@ const warmIO = new IntersectionObserver(entries => {
       if (s._played && s._mp4Url && isSaved(s._post && s._post.id)) queueMp4Cache(s._mp4Url);
     }
   }
-}, { rootMargin: '150% 0px 150% 0px', threshold: 0 });
+}, { root: feed, rootMargin: '150% 0px 150% 0px', threshold: 0 });
 
 // WebKit (iPhone Safari/Orion) only lets a media element produce sound if a
 // play() was ever issued on it DURING a user gesture. A swipe is a gesture:
@@ -2660,9 +2666,22 @@ function blessNearbyVideos(e) {
   const near = [base.previousElementSibling, base, after, after && after.nextElementSibling];
   for (const s of near) {
     const v = s && s._video;
-    if (!v || s._blessed) continue;
+    if (!v) continue;
+    const a = s._audio;                          // mp4+audio-el: separate element, blessed separately
+    if (a && a.paused && !s._audioBlessed) {
+      s._audioBlessed = true;
+      if (!v.paused) a.currentTime = v.currentTime;
+      const pa = a.play();
+      if (v.paused) a.pause();                   // playing video: keep its sound running
+      if (pa) pa.catch(err => { if (err && err.name === 'NotAllowedError') s._audioBlessed = false; });
+    }
+    if (s._blessed) continue;
+    if (!v.paused) {                             // can't play()+pause() it without stopping it
+      // muted after an autoplay refusal: leave it unblessed for a later gesture
+      if (!v.muted || a) s._blessed = true;
+      continue;
+    }
     s._blessed = true;
-    if (!v.paused) continue;                     // already playing (the current one)
     const p = v.play();                          // inside the gesture → grants sound
     v.pause();                                   // sync pause: no audible blip
     if (p) p.catch(err => { if (err && err.name === 'NotAllowedError') s._blessed = false; });
