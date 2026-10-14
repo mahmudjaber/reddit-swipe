@@ -143,7 +143,10 @@ function toggleSave(post, btn) {
 let mode = 'my';             // 'my' = mixed algorithmic feed, 'sub' = single subreddit
 let currentSub = null;       // when mode === 'sub'
 let loading = false;
-let soundOn = false;         // global mute state (autoplay must start muted)
+// bumped on every feed rebuild — in-flight loads from an older build drop their results
+let gen = 0;
+function newBuild() { gen++; loading = false; my.fetchP = null; bufWaiters.splice(0).forEach(r => r()); }
+let soundOn = false;        // global mute state (autoplay must start muted)
 const seen = new Set();      // per-feed-build fetch dedup
 const shownIds = new Set();  // everything shown this session — refresh won't repeat these
 
@@ -158,15 +161,26 @@ const my = {
   sorts: {},                 // sub -> [sort, t] chosen for this session/refresh
   buffer: [],                // fetched-but-not-shown posts
   afters: {},                // sub -> cursor; null = exhausted
-  fetching: false,
-  slot: 0,                   // position in the video/still rhythm, survives batches
+  fetchP: null,              // in-flight refill, shared by every caller
+  slot: 0,                  // position in the video/still rhythm, survives batches
   videoYield: {},            // sub -> videos found so far (guides deep refills)
   sortCursor: (Math.random() * 4) | 0,  // advanced on refresh → different sorts
   personaIdx: (Math.random() * 5) | 0,  // advanced on refresh → different ranking feel
   persona: null,
   spotlight: null,           // subs boosted this refresh so different subs lead
   recycled: false,           // whether shownIds was already recycled this build
+  order: null,               // this build's seeded sub order (fetch priority)
 };
+
+// first render waits only until the buffer can make a varied batch, not
+// for the whole fetch round — the slowest sub no longer sets the pace
+let bufWaiters = [];
+function notifyBuffer(force) {
+  const vids = my.buffer.reduce((c, p) => c + (p._rv ? 1 : 0), 0);
+  const subsIn = new Set(my.buffer.map(p => p.subreddit)).size;
+  if (force || (my.buffer.length >= BATCH_SIZE && vids >= 4 && subsIn >= 3)) bufWaiters.splice(0).forEach(r => r());
+}
+const bufferReady = () => new Promise(r => { bufWaiters.push(r); notifyBuffer(); });
 
 const SORTS = [['hot', null], ['top', 'day'], ['rising', null], ['top', 'week']];
 
@@ -202,27 +216,47 @@ let activeFetches = 0;
 const MAX_CONCURRENT = 2;
 const SPACING_MS = 400;
 
-function politeFetch(url, opts) {
+// the clock starts when the request leaves the queue, not when it joins it,
+// and keeps running through the body read; paused while a 429 retry waits
+function withTimeout(ms) {
+  const ctl = new AbortController();
+  let t = 0;
+  return {
+    signal: ctl.signal,
+    start: () => { clearTimeout(t); t = setTimeout(() => ctl.abort(), ms); },
+    done: () => clearTimeout(t),
+  };
+}
+
+function politeFetch(url, opts, timer) {
   return new Promise((resolve, reject) => {
-    fetchQueue.push({ url, opts, resolve, reject });
+    fetchQueue.push({ url, opts, timer, resolve, reject });
     pumpQueue();
   });
 }
+let queuePausedUntil = 0;
 async function pumpQueue() {
+  const now = Date.now();
+  if (now < queuePausedUntil) { setTimeout(pumpQueue, queuePausedUntil - now); return; }
   if (activeFetches >= MAX_CONCURRENT || fetchQueue.length === 0) return;
   const job = fetchQueue.shift();
+  if (job.opts && job.opts.signal && job.opts.signal.aborted) {
+    job.reject(new DOMException('aborted', 'AbortError'));
+    setTimeout(pumpQueue, 0);
+    return;
+  }
   activeFetches++;
   try {
-    let res = await fetch(job.url, job.opts);
-    if (res.status === 429) {
+    if (job.timer) job.timer.start();
+    const res = await fetch(job.url, job.opts);
+    if (res.status === 429 && !job.retried) {
       const wait = Math.min(parseInt(res.headers.get('retry-after'), 10) || 15, 60);
-      if (feed.children.length === 0) {
-        showStatus(`Reddit rate limit — retrying in ${wait}s…`);
-      }
-      await new Promise(r => setTimeout(r, wait * 1000));
-      res = await fetch(job.url, job.opts);
-    }
-    job.resolve(res);
+      queuePausedUntil = Date.now() + wait * 1000;   // global pause: the limit is per client
+      if (feed.children.length === 0) showStatus(`Reddit rate limit — retrying in ${wait}s…`);
+      if (job.timer) job.timer.done();
+      job.retried = true;
+      fetchQueue.unshift(job);
+    } else job.resolve(res);
   } catch (e) {
     job.reject(e);
   } finally {
@@ -231,8 +265,16 @@ async function pumpQueue() {
   }
 }
 
-const pageCache = new Map();   // url -> { json, at }
+const pageCache = new Map();   // url -> { json, at }; first pages only, oldest first
 const PAGE_CACHE_MS = 5 * 60_000;
+const PAGE_CACHE_MAX = 60;
+function pageCachePut(url, json) {
+  const now = Date.now();
+  for (const [k, v] of pageCache) if (now - v.at >= PAGE_CACHE_MS) pageCache.delete(k);
+  pageCache.delete(url);
+  pageCache.set(url, { json, at: now });
+  while (pageCache.size > PAGE_CACHE_MAX) pageCache.delete(pageCache.keys().next().value);
+}
 
 async function fetchSubPage(sub, sort, t, cursor) {
   if (DEMO) return demoPage(cursor);
@@ -243,23 +285,38 @@ async function fetchSubPage(sub, sort, t, cursor) {
     ? `https://www.reddit.com/r/${encodeURIComponent(sub)}/${sort}.json?${qs}`
     : `${API_BASE}/api/feed?sub=${encodeURIComponent(sub)}&sort=${sort}&${qs}`;
 
-  const cached = pageCache.get(url);
-  if (cached && Date.now() - cached.at < PAGE_CACHE_MS) return cached.json;
-
-  const res = await politeFetch(url, EXTENSION ? { credentials: 'include' } : undefined);
-  if (!res.ok) {
-    if (EXTENSION) {
-      throw new Error('Reddit responded HTTP ' + res.status +
-        (res.status === 403 ? ' — open reddit.com in another tab (log in), then tap here to retry' :
-         res.status === 429 ? ' — rate limited; wait a minute, then tap here to retry' : ''));
-    }
-    let msg = 'proxy responded ' + res.status;
-    try { const e = await res.json(); if (e.error) msg = e.error; } catch {}
-    throw new Error(msg);
+  const cached = !cursor && pageCache.get(url);
+  if (cached) {
+    if (Date.now() - cached.at < PAGE_CACHE_MS) return cached.json;
+    pageCache.delete(url);
   }
-  const json = await res.json();
-  pageCache.set(url, { json, at: Date.now() });
-  return json;
+
+  for (let attempt = 0; ; attempt++) {
+    const to = withTimeout(15000);
+    try {
+      const res = await politeFetch(url, { ...(EXTENSION ? { credentials: 'include' } : {}), signal: to.signal }, to);
+      if (!res.ok) {
+        if (EXTENSION) {
+          throw new Error('Reddit responded HTTP ' + res.status +
+            (res.status === 403 ? ' — open reddit.com in another tab (log in), then tap here to retry' :
+             res.status === 429 ? ' — rate limited; wait a minute, then tap here to retry' : ''));
+        }
+        let msg = 'proxy responded ' + res.status;
+        try { const e = await res.json(); if (e.error) msg = e.error; } catch {}
+        throw new Error(msg);
+      }
+      const json = await res.json();
+      if (!cursor) pageCachePut(url, json);
+      return json;
+    } catch (e) {
+      if (to.signal.aborted && attempt === 0) continue;
+      // must not match the 403|404|451 blacklist test in ensureBuffer
+      if (to.signal.aborted) throw new Error('network timeout — tap to retry');
+      throw e;
+    } finally {
+      to.done();
+    }
+  }
 }
 
 /* =======================================================================
@@ -574,6 +631,7 @@ function rotatedSortPlan() {
   my.sortCursor = (my.sortCursor + 1) % 9973;
   const order = [...subs].sort((a, b) =>
     seededRand(my.seed ^ hashStr(a)) - seededRand(my.seed ^ hashStr(b)));
+  my.order = order;
   const pool = my.persona.sorts;
   const plan = {};
   order.forEach((s, i) => { plan[s] = pool[(i + my.sortCursor) % pool.length]; });
@@ -582,15 +640,17 @@ function rotatedSortPlan() {
   return plan;
 }
 
-async function ensureBuffer() {
-  if (my.fetching) return;
-  my.fetching = true;
-  try {
+// returns the in-flight refill when there is one, so every caller can await it
+function ensureBuffer() {
+  if (my.fetchP) return my.fetchP;
+  const g = gen;
+  const p = (async () => {
     // videos deplete 3x faster than stills, and picture-heavy subs may only
     // have a handful per page — paginate deeper (up to 3 rounds) until the
     // video pool is healthy, and after round 1 only re-fetch subs that have
     // actually been yielding videos, to not waste rate budget on photo subs.
     for (let round = 0; round < 3; round++) {
+      if (g !== gen) return;
       const videoCount = my.buffer.reduce((c, p) => c + (p._rv ? 1 : 0), 0);
       if (my.buffer.length >= MIN_BUFFER && videoCount >= MIN_VIDEO_BUFFER) return;
       let pending = subs.filter(s => my.afters[s] !== null); // null = exhausted
@@ -599,14 +659,28 @@ async function ensureBuffer() {
         if (yielding.length) pending = yielding;
       }
       if (pending.length === 0) return;
+      // the queue is FIFO, so spotlight subs' listings come back first
+      const rank = s => (my.spotlight && my.spotlight.has(s.toLowerCase()) ? 0 : 1);
+      const ord = s => (my.order ? my.order.indexOf(s) : 0);
+      pending.sort((a, b) => rank(a) - rank(b) || ord(a) - ord(b));
       const results = await Promise.allSettled(pending.map(async sub => {
         const [sort, t] = my.sorts[sub] || ['hot', null];
         const data = await fetchSubPage(sub, sort, t, my.afters[sub]);
+        if (g !== gen) return;                       // stale build: drop the page
         my.afters[sub] = data.data.after || null;
         const posts = usablePosts(data, true);   // never re-show this session's posts
         my.videoYield[sub] = (my.videoYield[sub] || 0) + posts.filter(p => p._rv).length;
         my.buffer.push(...posts);
+        notifyBuffer();
       }));
+      if (g !== gen) return;
+      const failures = results.filter(r => r.status === 'rejected');
+      if (failures.length === pending.length) {
+        // everything failed at once (offline, logged out, rate limited) — a
+        // global failure, so blacklist nothing and let a retry fetch again
+        if (my.buffer.length) break;
+        throw failures[0].reason;
+      }
       // banned/private/typo'd subs (common in imported lists) 404 forever —
       // mark them exhausted so they can't stall or re-fetch every round
       results.forEach((r, i) => {
@@ -614,19 +688,25 @@ async function ensureBuffer() {
           my.afters[pending[i]] = null;
         }
       });
-      const failures = results.filter(r => r.status === 'rejected');
-      if (failures.length === pending.length) throw failures[0].reason;
     }
-  } finally {
-    my.fetching = false;
-  }
+  })().finally(() => {
+    if (my.fetchP === p) my.fetchP = null;
+    if (g === gen) notifyBuffer(true);   // a stale fill must not wake the new build's waiters
+  });
+  my.fetchP = p;
+  return p;
 }
 
 async function myLoadMore() {
   if (loading) return;
   loading = true;
+  const g = gen;
   try {
-    await ensureBuffer();
+    const fill = ensureBuffer();
+    fill.catch(() => {});
+    if (feed.children.length === 0) await Promise.race([fill, bufferReady()]);
+    else if (my.buffer.length < BATCH_SIZE) await fill;
+    if (g !== gen || mode !== 'my') return;
     const batch = pickBatch(my.buffer, my.seed, BATCH_SIZE);
     for (const post of batch) {
       const slide = buildSlide(post);
@@ -641,16 +721,16 @@ async function myLoadMore() {
         seen.clear();
         my.afters = {};
         loading = false;
-        return myLoadMore();
+        return await myLoadMore();   // await: our finally must not clear the retry's loading flag
       }
       showStatus('No playable posts found in your subreddits — edit the list with ＋', false, EDIT_FEEDS);
-    }
-    ensureBuffer(); // fire-and-forget refill for the next batch
+    } else showStatus('Nothing loaded yet — tap to retry', false);
+    ensureBuffer().catch(() => {}); // fire-and-forget refill for the next batch
   } catch (err) {
     console.error(err);
-    if (feed.children.length === 0) showStatus('Could not load your feed — ' + err.message, false, EDIT_FEEDS);
+    if (g === gen && feed.children.length === 0) showStatus('Could not load your feed — ' + err.message, false, EDIT_FEEDS);
   } finally {
-    loading = false;
+    if (g === gen) loading = false;
   }
 }
 
@@ -658,6 +738,7 @@ function enterMyFeed(reset) {
   mode = 'my';
   currentSub = null;
   if (reset) {
+    newBuild();
     my.seed = (Math.random() * 2 ** 31) | 0;
     my.sorts = rotatedSortPlan();
     my.buffer = [];
@@ -680,9 +761,11 @@ function enterMyFeed(reset) {
 async function subLoadMore() {
   if (loading || subExhausted) return;
   loading = true;
+  const g = gen;
   try {
     const [sort, t] = SORTS[subSortIdx];
     const data = await fetchSubPage(currentSub, sort, t, subAfter);
+    if (g !== gen || mode !== 'sub') return;
     subAfter = data.data.after;
     if (!subAfter) subExhausted = true;
     let added = 0;
@@ -691,21 +774,22 @@ async function subLoadMore() {
       if (slide) { feed.appendChild(slide); added++; }
     }
     hideStatus();
-    if (added === 0 && !subExhausted) { loading = false; return subLoadMore(); }
+    if (added === 0 && !subExhausted) { loading = false; return await subLoadMore(); }
     if (feed.children.length === 0) {
       showStatus('No playable video/image posts found in r/' + currentSub, false);
     }
   } catch (err) {
     console.error(err);
-    if (feed.children.length === 0) {
+    if (g === gen && feed.children.length === 0) {
       showStatus('Could not load r/' + currentSub + ' — ' + err.message, false);
     }
   } finally {
-    loading = false;
+    if (g === gen) loading = false;
   }
 }
 
 function enterSub(sub, resetSort) {
+  newBuild();
   mode = 'sub';
   currentSub = sub;
   if (resetSort) subSortIdx = 0;
@@ -983,6 +1067,7 @@ function openEditor() {
     saveSubs();
     overlay.remove();
     if (subs.length === 0) {
+      newBuild();    // an in-flight load of the old feed must not render behind the status
       mode = 'my';
       currentSub = null;
       clearFeed();   // nothing may keep playing behind the status layer
@@ -1042,6 +1127,7 @@ async function downloadPost(post, s, btn) {
 }
 
 function enterSavedFeed(startId) {
+  newBuild();
   mode = 'saved';
   currentSub = null;
   clearFeed();
@@ -1192,6 +1278,8 @@ function toast(msg, { action, onAction, ms = 2500 } = {}) {
 }
 statusEl.addEventListener('click', () => {
   if (!loading && feed.children.length === 0) {
+    // un-blacklist subs a logged-out 403 (or a 404 blip) marked exhausted
+    if (mode === 'my') for (const s of subs) if (my.afters[s] === null) delete my.afters[s];
     showStatus('Retrying…');
     loadMore();
   }
