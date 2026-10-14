@@ -1456,7 +1456,9 @@ function openProfile() {
       c.onclick = () => { overlay.remove(); enterSavedFeed(p.id); };
       c.tabIndex = 0;
       c.setAttribute('role', 'button');
-      c.onkeydown = e => { if (e.key === 'Enter' && e.target === c) c.click(); };
+      c.onkeydown = e => {
+        if ((e.key === 'Enter' || e.key === ' ') && e.target === c) { e.preventDefault(); c.click(); }
+      };
       grid.appendChild(c);
     }
     sect.textContent = `Saved posts (${visible}${hidden ? ', ' + hidden + ' hidden 18+' : ''})`;
@@ -2392,11 +2394,12 @@ document.addEventListener('keydown', e => {
   switch (k) {
     case 'ArrowDown': case 'j': case 'PageDown': if (!e.repeat) stepSlide(1); break;
     case 'ArrowUp': case 'k': case 'PageUp': if (!e.repeat) stepSlide(-1); break;
-    case ' ': if (cur?._video) cur.click(); break;
-    case 'm': toggleSound(); break;
-    case 's': cur?._saveBtn?.click(); break;
-    case 'd': cur?._dlBtn?.click(); break;
-    case 'r': if (!loading) refresh(); break;
+    // toggles ignore auto-repeat: a held key must not flip save or queue downloads
+    case ' ': if (!e.repeat && cur?._video) cur.click(); break;
+    case 'm': if (!e.repeat) toggleSound(); break;
+    case 's': if (!e.repeat) cur?._saveBtn?.click(); break;
+    case 'd': if (!e.repeat) cur?._dlBtn?.click(); break;
+    case 'r': if (!e.repeat && !loading) refresh(); break;
     case 'ArrowLeft': case 'ArrowRight': {
       const car = cur?.querySelector('.carousel');
       if (car) pageCarousel(car, k === 'ArrowRight' ? 1 : -1);

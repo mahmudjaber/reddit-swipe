@@ -501,6 +501,8 @@
     outline: 2px solid #ffd7a8;
     outline-offset: 2px;
   }
+  /* .chips scrolls, so it clips anything drawn outside a chip */
+  .chips .chip:focus-visible { outline-offset: -2px; }
   .editor-btn {
     background: rgba(255,255,255,.14);
     border: none;
