@@ -1,4 +1,4 @@
-const APP_VERSION = '1.22.0';   // shown in the ＋ editor — bump with manifest.json
+const APP_VERSION = '1.22.1';   // shown in the ＋ editor — bump with manifest.json
 
 /* ================= CONFIG ================= */
 // Default subreddits for first launch — after that, edit your list in the app
