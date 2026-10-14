@@ -1,4 +1,4 @@
-const APP_VERSION = '1.24.0';   // shown in the ＋ editor — bump with manifest.json
+const APP_VERSION = '1.24.1';   // shown in the ＋ editor — bump with manifest.json
 
 /* ================= CONFIG ================= */
 // Default subreddits for first launch — after that, edit your list in the app
@@ -110,7 +110,8 @@ function saveSubs() {
   try {
     localStorage.setItem('rs.feeds', JSON.stringify(feeds));
     localStorage.setItem('rs.activeFeed', String(activeFeed));
-  } catch (e) { console.warn('saveSubs failed', e); }
+    return true;
+  } catch (e) { console.warn('saveSubs failed', e); return false; }
 }
 function switchFeed(i) {
   activeFeed = Math.max(0, Math.min(i, feeds.length - 1));
@@ -1304,6 +1305,77 @@ function fold(label, className) {
   return d;
 }
 
+// merges, never replaces: feeds by name (sub lists unioned), saves/hidden/seen/taste
+// by key — existing saves are never evicted to make room for a backup's
+function restoreBackup(j) {
+  const okSub = x => typeof x === 'string' && /^[A-Za-z0-9_]{2,21}$/.test(x);
+  if (!j || j.app !== 'reddit-swipe' || !Array.isArray(j.feeds)) return null;
+  const inFeeds = j.feeds.filter(f => f && typeof f.name === 'string' && f.name && Array.isArray(f.subs));
+  if (!inFeeds.length) return null;
+  saveSubs();
+  // a fresh install's untouched default feed shouldn't push the restored ones aside
+  const pristine = feeds.length === 1 && feeds[0].name === '⭐ My Feed' && feeds[0].subs.join() === DEFAULT_SUBREDDITS.join();
+  const activeObj = feeds[activeFeed];
+  const wantSrc = j.feeds[j.activeFeed | 0];
+  let wantObj = null, added = 0;
+  if (pristine) feeds = [];
+  for (const f of inFeeds) {
+    const name = f.name.slice(0, 40);
+    const good = f.subs.filter(okSub);
+    let mine = feeds.find(x => x.name === name);
+    if (!mine) {
+      mine = f.nsfw === true ? { name, subs: good, nsfw: true } : { name, subs: good };
+      feeds.push(mine);
+      added++;
+    } else {
+      const have = new Set(mine.subs.map(x => x.toLowerCase()));
+      for (const x of good) if (!have.has(x.toLowerCase())) { have.add(x.toLowerCase()); mine.subs.push(x); }
+    }
+    if (f === wantSrc) wantObj = mine;
+  }
+  activeFeed = Math.max(0, feeds.indexOf(pristine ? (wantObj || feeds[0]) : activeObj));
+  subs = feeds[activeFeed].subs;
+  if (j.nsfw === true && !showNsfw && confirm('This backup has 18+ posts turned on. Turn them on here too?')) {
+    showNsfw = true;
+    persistNsfw();
+  }
+
+  const savedBefore = savedPosts.slice();
+  let saved = 0, skipped = 0;
+  if (Array.isArray(j.saved)) {
+    const have = new Set(savedPosts.map(p => p.id));
+    const cand = [];
+    for (const p of j.saved) {
+      if (!p || typeof p.id !== 'string' || have.has(p.id)) continue;
+      try { cand.push(slimPost(p)); have.add(p.id); } catch {}
+    }
+    cand.sort((x, y) => (y.savedAt || 0) - (x.savedAt || 0));
+    const keep = cand.slice(0, Math.max(0, SAVED_MAX - savedPosts.length));
+    savedPosts.push(...keep);
+    savedPosts.sort((x, y) => (y.savedAt || 0) - (x.savedAt || 0));
+    saved = keep.length;
+    skipped = cand.length - keep.length;
+  }
+  if (Array.isArray(j.hidden)) for (const h of j.hidden) if (typeof h === 'string') hiddenSubs.add(h.toLowerCase());
+  if (Array.isArray(j.seen)) {
+    const have = new Set(seenRing);
+    seenRing = j.seen.filter(id => typeof id === 'string' && !have.has(id)).concat(seenRing).slice(-SEEN_MAX);
+  }
+  const okEntry = e => Array.isArray(e) && e.length === 4 && e.every(Number.isFinite);
+  if (j.taste && j.taste.v === 1) for (const m of ['subs', 'fmt']) {
+    const src = j.taste[m];
+    if (src && typeof src === 'object') for (const k of Object.keys(src)) if (k !== '__proto__' && !own(T[m], k) && okEntry(src[k])) T[m][k] = src[k];
+  }
+  const feedsOk = saveSubs();
+  let savesOk = true;
+  if (saved) {
+    savesOk = persistSaved();
+    if (!savesOk) { savedPosts = savedBefore; saved = 0; }
+  }
+  saveHidden(); flushSeen(); flushTaste();
+  return { feeds: inFeeds.length, added, saved, skipped, feedsOk, savesOk };
+}
+
 function openEditor() {
   if (document.querySelector('.editor-overlay')) return;
   const overlay = el('div', 'editor-overlay');
@@ -1495,6 +1567,51 @@ function openEditor() {
 
   /* ----- advanced: transfer, debug, cache ----- */
   const advanced = fold('Advanced', 'editor-fold');
+
+  // a file survives what localStorage can't: uninstalls, extension ID changes, other devices
+  advanced.appendChild(el('div', 'editor-sect', 'Backup'));
+  const backupRow = el('div', 'editor-add');
+  const exportBtn = el('button', 'editor-btn', '💾 Save backup file');
+  exportBtn.onclick = () => {
+    saveSubs(); flushTaste(); flushSeen();
+    const data = { app: 'reddit-swipe', v: 1, at: Date.now(), feeds, activeFeed, nsfw: showNsfw,
+      saved: savedPosts, taste: T, hidden: [...hiddenSubs], seen: seenRing };
+    const json = JSON.stringify(data, (k, v) => (k === '_rv' || k === '_redgifs') ? undefined : v);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
+    a.download = 'reddit-swipe-backup-' + new Date().toISOString().slice(0, 10) + '.json';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 30_000);
+    exportBtn.textContent = 'Saved ✓';
+    setTimeout(() => (exportBtn.textContent = '💾 Save backup file'), 1500);
+  };
+  const importBtn = el('button', 'editor-btn', '📥 Restore backup');
+  const fileIn = document.createElement('input');
+  fileIn.type = 'file';
+  fileIn.accept = '.json,application/json';
+  fileIn.hidden = true;
+  importBtn.onclick = () => fileIn.click();
+  fileIn.onchange = async () => {
+    const f = fileIn.files && fileIn.files[0];
+    fileIn.value = '';
+    if (!f) return;
+    let r = null;
+    try { r = restoreBackup(JSON.parse(await f.text())); } catch {}
+    if (!r) return alert('That file is not a Reddit Swipe backup');
+    if (!r.feedsOk) return alert('Storage is full — the backup could not be restored');
+    close();
+    switchFeed(activeFeed);
+    my.announced = gen;
+    const savesMsg = !r.savesOk ? 'saves didn\'t fit (storage full)'
+      : `${r.saved} new save${r.saved === 1 ? '' : 's'}` + (r.skipped ? ` · ${r.skipped} skipped (saves full)` : '');
+    toast(`Restored ${r.feeds} feed${r.feeds === 1 ? '' : 's'} · ${savesMsg}`, { ms: 5000 });
+  };
+  backupRow.appendChild(exportBtn);
+  backupRow.appendChild(importBtn);
+  backupRow.appendChild(fileIn);
+  advanced.appendChild(backupRow);
 
   // transfer settings between devices (desktop Chrome ⇄ iPhone Orion, …)
   const xferRow = el('div', 'editor-add');
