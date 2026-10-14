@@ -1401,6 +1401,7 @@ function armMp4(s, url) {
   const a = document.createElement('audio');
   a.src = base + '/' + AUDIO_NAMES[ai] + query;
   a.addEventListener('error', () => {
+    if (s._dead) return;
     if (++ai >= AUDIO_NAMES.length) { setBadge(s, '🔇 no sound in this video'); return; }
     a.src = base + '/' + AUDIO_NAMES[ai] + query;
     if (soundOn && !v.paused) { a.currentTime = v.currentTime; a.play().catch(() => {}); }
@@ -1648,7 +1649,10 @@ const warmIO = new IntersectionObserver(entries => {
       } else {
         // slide coming back into range after a cold teardown — re-arm from cache
         if (!v.getAttribute('src')) {
-          if (s._mp4Url) setMp4Src(s, v, s._mp4Url);
+          if (s._mp4Url) setMp4Src(s, v, s._mp4Url).then(() => {
+            // io's play() can run before the src lands (e.g. a cached redgifs url)
+            if (s === currentSlide && v.paused && v.getAttribute('src') && !s.classList.contains('paused')) v.play().catch(() => {});
+          });
           else if (s._src) v.src = s._src;
         }
         if (v.preload === 'none') {
