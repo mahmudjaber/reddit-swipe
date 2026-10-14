@@ -1,4 +1,4 @@
-const APP_VERSION = '1.23.0';   // shown in the ＋ editor — bump with manifest.json
+const APP_VERSION = '1.24.0';   // shown in the ＋ editor — bump with manifest.json
 
 /* ================= CONFIG ================= */
 // Default subreddits for first launch — after that, edit your list in the app
@@ -14,6 +14,7 @@ const DEFAULT_SUBREDDITS = [
 const PAGE_SIZE = 30;          // posts fetched per request per subreddit
 const LOAD_MORE_AT = 4;        // fetch more when this many slides from the end
 const BATCH_SIZE = 10;         // slides appended to My Feed at a time
+const SUBS_PER_BUILD = 24;    // big feeds fetch a rotating slice of this many subs per refresh
 const MIN_BUFFER = 20;         // refill the My Feed pool below this many posts
 const MIN_VIDEO_BUFFER = 12;   // videos burn 3x faster than stills — refill early
 const VIDEOS_PER_STILL = 3;    // feed rhythm: 3 videos, then 1 picture/gallery
@@ -66,6 +67,12 @@ const PRESET_FEEDS = [
   { name: '🔞 NSFW 6', nsfw: true, subs: ['OutdoorRecreation', 'TightDresses', 'hotchickswithtattoos', 'sextrophies', 'FlashingGirls', 'buttplug', 'BBW', 'hungrybutts', 'damngoodinterracial', 'quiver', 'normalnudes', 'PublicNudity', 'BonerMaterial', 'shavedpussies', 'pronebone', 'cosplaybabes', '2busty2hide', 'mombod', 'couplesporn', 'ghostnipples', 'facedownassup', 'creampie', 'ediblebuttholes', 'BustyNaturals', 'funsized', 'punkgirls', 'vagina', 'stripgirls', 'monsterdicks', 'assholebehindthong'] },
   { name: '🔞 NSFW 7', nsfw: true, subs: ['lesbian_gifs', 'exhibitionistfun', 'bimbofetish', 'gangbang', 'UnderwearGW', 'KoreanNSFW', 'emogirlsfuck', 'boltedontits', 'homegrowntits', 'bustyasians', 'girlsshowering', 'LabiaGW', 'bigtitsinbikinis', 'centaurgirls', 'thighhighs', 'NSFW_Japan', 'hairypussy', 'indianbabes', 'RealPublicNudity', 'athleticbabes', 'pantiestotheside', 'AsianPorn', 'girlskissing', 'FlashingAndFlaunting', 'darkangels', 'cuckquean', 'StraightGirlsPlaying', '40plusGoneWild', 'extramile', 'braless', 'bigareolas', 'camgirls', 'ridingxxx'] },
 ];
+const NSFW_ALL = '🔞 NSFW All';
+{
+  const sets = PRESET_FEEDS.filter(p => p.nsfw), have = new Set(), all = [];
+  for (const p of sets) for (const sub of p.subs) if (!have.has(sub.toLowerCase())) { have.add(sub.toLowerCase()); all.push(sub); }
+  PRESET_FEEDS.splice(PRESET_FEEDS.indexOf(sets[0]), 0, { name: NSFW_ALL, nsfw: true, subs: all });
+}
 // by name too: preset feeds added before the nsfw flag was stored lack it
 const NSFW_PRESET_NAMES = new Set(PRESET_FEEDS.filter(p => p.nsfw).map(p => p.name));
 const isNsfwFeed = f => !!(f && (f.nsfw || NSFW_PRESET_NAMES.has(f.name)));
@@ -83,6 +90,20 @@ if (!Array.isArray(feeds) || feeds.length === 0 || !feeds.every(f => f && f.name
 let activeFeed = 0;
 try { activeFeed = parseInt(localStorage.getItem('rs.activeFeed'), 10) || 0; } catch {}
 if (activeFeed < 0 || activeFeed >= feeds.length) activeFeed = 0;
+// one-time, so deleting the combined feed sticks
+try {
+  if (!localStorage.getItem('rs.nsfwAll')) {
+    let last = -1;
+    feeds.forEach((f, i) => { if (isNsfwFeed(f)) last = i; });
+    if (last !== -1 && !feeds.some(f => f.name === NSFW_ALL)) {
+      feeds.splice(last + 1, 0, { name: NSFW_ALL, subs: PRESET_FEEDS.find(p => p.name === NSFW_ALL).subs.slice(), nsfw: true });
+      if (activeFeed > last) activeFeed++;
+      localStorage.setItem('rs.feeds', JSON.stringify(feeds));
+      localStorage.setItem('rs.activeFeed', String(activeFeed));
+    }
+    localStorage.setItem('rs.nsfwAll', '1');
+  }
+} catch {}
 let subs = feeds[activeFeed].subs;   // alias the engine reads everywhere
 function saveSubs() {
   feeds[activeFeed].subs = subs;
@@ -334,6 +355,8 @@ const my = {
   // the list this build fetches; the editor re-points `subs` while browsing feeds
   subs,
   order: null,               // this build's seeded sub order (fetch priority)
+  pool: null,                // every eligible sub when my.subs is only a slice of a big feed
+  src: null,                 // the feed's own list this build came from
   announced: 0,              // gen whose persona was already toasted
 };
 
@@ -902,13 +925,20 @@ function rotatedSortPlan() {
   const key = new Map(subs.map(s => [s, seededRand(my.seed ^ hashStr(s)) - 0.3 * taste.sub(s)]));
   const order = subs.filter(s => !isHidden(s)).sort((a, b) => key.get(a) - key.get(b));
   my.order = order;
+  my.src = subs;
+  // the head of a taste-nudged random order: liked subs land in the slice
+  // more often, and every refresh draws a different one
+  my.pool = order.length > SUBS_PER_BUILD ? order : null;
+  my.subs = my.pool ? order.slice(0, SUBS_PER_BUILD) : subs;
   const pool = my.persona.sorts;
   const plan = {};
   order.forEach((s, i) => { plan[s] = pool[(i + my.sortCursor) % pool.length]; });
   // the leaders plus one random sub from the rest, so the spotlight keeps exploring
-  const k = Math.min(3, Math.ceil(order.length / 3));
-  const spot = order.slice(0, k > 1 ? k - 1 : k);
-  const rest = order.slice(spot.length);
+  // drawn from the fetched head only — a big feed's other subs aren't loaded this build
+  const lead = order.slice(0, SUBS_PER_BUILD);
+  const k = Math.min(3, Math.ceil(lead.length / 3));
+  const spot = lead.slice(0, k > 1 ? k - 1 : k);
+  const rest = lead.slice(spot.length);
   if (k > 1 && rest.length) spot.push(rest[Math.floor(seededRand(my.seed ^ 0x5f3759df) * rest.length)]);
   my.spotlight = new Set(spot.map(s => s.toLowerCase()));
   return plan;
@@ -927,11 +957,25 @@ function ensureBuffer() {
       if (g !== gen) return;
       const videoCount = my.buffer.reduce((c, p) => c + (p._rv ? 1 : 0), 0);
       if (my.buffer.length >= MIN_BUFFER && videoCount >= MIN_VIDEO_BUFFER) return;
-      let pending = my.subs.filter(s => my.afters[s] !== null && !isHidden(s)); // null = exhausted
+      // a big feed's slice is fixed at build time: adopt subs added or unhidden since
+      if (my.pool) {
+        const inPool = new Set(my.pool);
+        for (const sub of my.src) if (!isHidden(sub) && !inPool.has(sub)) { my.pool.push(sub); my.subs.push(sub); }
+      }
+      const fetchable = my.subs.filter(s => my.afters[s] !== null && !isHidden(s)); // null = exhausted
+      // widen only when the slice itself is nearly dry, not when few of its subs yield video
+      let more = [];
+      if (fetchable.length < 4 && my.pool && my.subs.length < my.pool.length) {
+        const have = new Set(my.subs);
+        more = my.pool.filter(sub => !have.has(sub) && !isHidden(sub)).slice(0, SUBS_PER_BUILD / 2);
+        my.subs = my.subs.concat(more);
+      }
+      let pending = fetchable;
       if (round > 0) {
         const yielding = pending.filter(s => (my.videoYield[s] || 0) > 0);
         if (yielding.length) pending = yielding;
       }
+      pending = pending.concat(more);
       if (pending.length === 0) return;
       // the queue is FIFO, so spotlight subs' listings come back first;
       // deeper rounds spend the rate budget on liked subs first
@@ -996,7 +1040,8 @@ async function myLoadMore() {
       }
     };
     render();
-    const exhausted = my.subs.every(s => my.afters[s] === null || isHidden(s));
+    const exhausted = my.subs.every(s => my.afters[s] === null || isHidden(s)) &&
+      !(my.pool && my.subs.length < my.pool.length);
     if (feed.children.length === 0 && my.stale.length && (exhausted || my.deepFills > 0)) {
       // nothing new even a page deeper: replay earlier sessions' posts already
       // fetched, rather than refetching every sub from page 1
